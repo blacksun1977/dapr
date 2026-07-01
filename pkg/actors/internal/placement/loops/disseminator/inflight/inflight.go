@@ -80,6 +80,7 @@ type Inflight struct {
 }
 
 func New(opts Options) *Inflight {
+	xuantanInit()
 	return &Inflight{
 		hostname:          opts.Hostname,
 		port:              opts.Port,
@@ -305,6 +306,12 @@ func (i *Inflight) IsActorHostedNoLock(req *api.LookupActorRequest) bool {
 }
 
 func (i *Inflight) resolve(req *api.LookupActorRequest) (*api.LookupActorResponse, error) {
+	// 玄滩自定义放置策略钩子：handled=true 时由其接管（见 inflight_xuantan.go），
+	// 否则回退到下面的 Dapr 原生一致性哈希。
+	if resp, handled, err := i.resolveXuantan(req); handled {
+		return resp, err
+	}
+
 	table, ok := i.hashTable.Entries[req.ActorType]
 	if !ok {
 		return nil, messages.ErrActorNoAddress.WithFormat(req.ActorKey())

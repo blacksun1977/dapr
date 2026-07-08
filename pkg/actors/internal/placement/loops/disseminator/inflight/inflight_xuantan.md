@@ -34,22 +34,66 @@ host。这对两类业务不可接受：
 - **返回约定**：`(resp, handled, err)`
     - `handled=false`：本策略不接管（未启用 / 非受管类型），调用方继续走原生哈希。
     - `handled=true`：本策略给出结果（`resp` 或 `err` 之一有效）。**Redis 故障也走此分支**，返回 `ErrActorNoAddress`（可重试），不降级回原生哈希。
-- **启用开关**：设置 `KEY_XT_PLACEMENT_REDIS_ADDR` 即开启；未设置时 `xuantanRDB == nil`，整体旁路，行为与官方一致。
+- **启用开关**：设置 `KEY_XT_PLACEMENT_CONFIG` 指向共享配置文件（含顶层 `placement:` 段）即开启；未设置该路径、
+  文件读取/解析失败、或文件里 `redis_addr` 为空时 `xuantanRDB == nil`，整体旁路，行为与官方一致。
 
-## 3. 环境变量
+## 3. 配置（环境变量 + 共享配置文件）
 
-| 变量                                   | 含义                                        | 默认值              |
-|--------------------------------------|-------------------------------------------|------------------|
-| `KEY_XT_PLACEMENT_REDIS_ADDR`        | Redis 地址，逗号分隔（多地址即集群/哨兵）。**置空=整个策略关闭**    | 空（关闭）            |
-| `KEY_XT_PLACEMENT_REDIS_PASSWORD`    | Redis 密码                                  | 空                |
-| `KEY_XT_PLACEMENT_REDIS_DB`          | Redis DB 序号                               | `0`              |
-| `KEY_XT_PLACEMENT_KEY_PREFIX`        | 绑定 key 前缀（bind）                           | `xt:dapr:bind:`  |
-| `KEY_XT_PLACEMENT_IDS_PREFIX`        | room 有效 id 集合（SET）前缀                      | `xt:dapr:ids:`   |
-| `KEY_XT_PLACEMENT_BIND_TTL`          | table 绑定 TTL（Go duration，如 `3h`、`90m`）    | `3h`             |
-| `KEY_XT_PLACEMENT_STICKY_TYPE_TABLE` | 走 table 策略的 actorType 集合（逗号分隔）            | `table_py,table` |
-| `KEY_XT_PLACEMENT_STICKY_TYPE_ROOM`  | 走 room 策略的 actorType 集合（逗号分隔）             | `room_py,room`   |
-| `KEY_XT_PLACEMENT_ROOM_CAP_PER_HOST` | 每 host 的 room 容量上限（= worker 槽数）；`0`/未设=不限 | `0`（不限）          |
+daprd 只认一个环境变量——配置文件路径；所有参数都来自该文件的 `placement:` 段。**该文件由 daprd 与业务侧
+（`core/actor` 的 `PlacementConfig`）共读同一份**，保证两侧「同一 Redis、同一 key」。
 
+| 环境变量                   | 含义                                          | 默认值    |
+|------------------------|---------------------------------------------|--------|
+| `KEY_XT_PLACEMENT_CONFIG` | 共享配置文件路径（YAML，含顶层 `placement:` 段）。**未设置=整个策略关闭** | 空（关闭） |
+
+### 3.1 配置文件格式（YAML，顶层 `placement:` 段）
+
+业务侧 actor 进程配置文件与 daprd 复用同一份；`placement:` 段字段与 `core/actor.PlacementConfig` 的 yaml
+tag 完全一致，其中 `redis:` 子段格式与业务其余 Redis 配置 `core/infra.RedisConfig` 一致：
+
+```yaml
+# 业务侧 actor 进程还会读同文件的 actor: 段；daprd 只读 placement: 段。
+placement:
+  redis:                         # Redis 连接（格式同 core/infra.RedisConfig）
+    addresses:                   # 地址列表：单条=单节点、多条=Cluster；为空=整个策略关闭
+      - "127.0.0.1:6379"
+    username: ""                 # Redis 6+ ACL 用户名（可选）
+    password: ""                 # Redis 密码
+    db: 0                        # 逻辑库编号（仅单节点生效）
+    dial_timeout: "2s"           # 拨号/Ping 超时（Go duration），空缺省 2s
+    read_timeout: "3s"           # 读超时，空缺省 3s
+    write_timeout: "3s"          # 写超时，空缺省 3s
+    pool_size: 0                 # 每 endpoint 最大连接数，0=go-redis 估算
+    min_idle_conns: 0            # 每 endpoint 最少空闲连接
+  key_prefix: "xt:dapr:bind:"    # 绑定 key 前缀（bind）
+  ids_prefix: "xt:dapr:ids:"     # room 有效 id 集合（SET）前缀
+  bind_ttl: "3h"                 # table 绑定 TTL（Go duration，如 3h/90m）；room 无 TTL
+  sticky_type_table:             # 走 table 策略的 actorType 列表
+    - "table_py"
+    - "table"
+  sticky_type_room:              # 走 room 策略的 actorType 列表
+    - "room_py"
+    - "room"
+  room_cap_per_host: 0           # 每 host 的 room 容量上限（= worker 槽数）；0/未设=不限
+```
+
+| 字段                  | 含义                                        | 默认值                |
+|---------------------|-------------------------------------------|--------------------|
+| `redis`             | Redis 连接（格式同 `core/infra.RedisConfig`）；`addresses` 为空=整个策略关闭 | —          |
+| `key_prefix`        | 绑定 key 前缀（bind）                           | `xt:dapr:bind:`    |
+| `ids_prefix`        | room 有效 id 集合（SET）前缀                      | `xt:dapr:ids:`     |
+| `bind_ttl`          | table 绑定 TTL（Go duration，如 `3h`、`90m`）    | `3h`               |
+| `sticky_type_table` | 走 table 策略的 actorType 列表                  | `[table_py, table]` |
+| `sticky_type_room`  | 走 room 策略的 actorType 列表                   | `[room_py, room]`   |
+| `room_cap_per_host` | 每 host 的 room 容量上限（= worker 槽数）；`0`/未设=不限 | `0`（不限）            |
+
+> 业务侧用 `core/infra.NewRedisClient` 据 `redis:` 段建客户端（单/Cluster 自动判定 + 建连 Ping 校验）；
+> daprd 侧读同样的 `redis:` 键、按相同语义构造 `redis.UniversalClient`。
+
+> 缺省值在 daprd 侧 `xuantanInit` 与业务侧 `manager` 各自回落，两侧保持一致。业务侧的读写入口见
+> `core/actor` 的 `IManager.GetPlacementBinding` / `SetPlacementBinding`（Redis 连接按 `PlacementConfig`
+> 延迟建立、进程内复用）。
+>
 > actorType 集合非常小（table ≤3、room ≤4），内部合并成一张带 `kind` 标记的切片 `xuantanTypeKinds`，用**线性扫描**（
 `xuantanKindOf`）查找——规模这么小，线性扫描比 map 省去哈希/分配，更快更省内存。
 
@@ -60,7 +104,7 @@ host。这对两类业务不可接受：
 ```
 key   = <KEY_PREFIX><actorType>:<actorID>     例: xt:dapr:bind:table:123456
 value = <hostAddr>
-TTL   = KEY_XT_PLACEMENT_BIND_TTL（默认 3h）
+TTL   = placement.bind_ttl（默认 3h）
 ```
 
 ### 4.2 room（每个 actorType 一张 hash + 一个外部维护的 SET）
@@ -200,7 +244,7 @@ bind 字段 `HDEL`，既释放容量又自清理。
 
 | 场景                       | 行为                                 |
 |--------------------------|------------------------------------|
-| 未配置 Redis 地址             | 整体旁路，回退原生哈希                        |
+| 未配置 KEY_XT_PLACEMENT_CONFIG / 文件缺失 / redis_addr 为空 | 整体旁路，回退原生哈希 |
 | actorType 非受管            | 旁路，回退原生哈希                          |
 | Redis 操作失败（table/room）   | 记日志，`handled=true` + `ErrActorNoAddress`（可重试），**不降级**（降级会破坏 table 粘性、room 均衡/容量） |
 | ring 无该 actorType / 候选为空 | `ErrActorNoAddress`（可重试）           |
@@ -226,8 +270,8 @@ daprd 侧不负责增删 ids SET，只读取它做有效性校验与自清理。
 |--------------|-------------------------------------------|
 | Redis 操作超时   | `2s`                                      |
 | 本地缓存 GC 周期   | `1min`                                    |
-| table 绑定 TTL | `KEY_XT_PLACEMENT_BIND_TTL`，默认 `3h`，不续期   |
+| table 绑定 TTL | `placement.bind_ttl`，默认 `3h`，不续期   |
 | room 绑定 TTL  | 无（常驻，靠重分配/ids 清理）                         |
-| room 容量上限    | `KEY_XT_PLACEMENT_ROOM_CAP_PER_HOST`，默认不限 |
+| room 容量上限    | `placement.room_cap_per_host`，默认不限 |
 | table 单激活    | Lua CAS（SET NX / 旧值匹配覆盖）                  |
 | room 单激活     | 单条 Lua（HGET 粘性 + 最少负载 HSET）               |

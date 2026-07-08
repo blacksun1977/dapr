@@ -133,23 +133,20 @@ func TestXuantanKindOf(t *testing.T) {
 }
 
 func TestXuantanAppendTypes(t *testing.T) {
-	const env = "XT_TEST_APPEND_TYPES"
-
-	t.Setenv(env, " a , b ,, c ")
-	got := xuantanAppendTypes(nil, env, "def", xtKindTable)
+	got := xuantanAppendTypes(nil, []string{" a ", " b ", "", " c "}, []string{"def"}, xtKindTable)
 	require.Len(t, got, 3)
 	assert.Equal(t, xuantanTypeKind{typ: "a", kind: xtKindTable}, got[0])
 	assert.Equal(t, xuantanTypeKind{typ: "b", kind: xtKindTable}, got[1])
 	assert.Equal(t, xuantanTypeKind{typ: "c", kind: xtKindTable}, got[2])
 
-	// 未设置环境变量时回退默认列表
-	got2 := xuantanAppendTypes(nil, "XT_TEST_APPEND_TYPES_UNSET", "x,y", xtKindRoom)
+	// 配置为空时回退默认列表
+	got2 := xuantanAppendTypes(nil, nil, []string{"x", "y"}, xtKindRoom)
 	require.Len(t, got2, 2)
 	assert.Equal(t, xuantanTypeKind{typ: "x", kind: xtKindRoom}, got2[0])
 	assert.Equal(t, xuantanTypeKind{typ: "y", kind: xtKindRoom}, got2[1])
 
 	// 追加语义：在已有切片后继续追加
-	merged := xuantanAppendTypes(got2, env, "def", xtKindTable)
+	merged := xuantanAppendTypes(got2, []string{" a ", " b ", "", " c "}, []string{"def"}, xtKindTable)
 	require.Len(t, merged, 5)
 }
 

@@ -42,8 +42,10 @@ package inflight
 // 本地缓存每次都用 ring 复核存活，host 一旦失效即弃用缓存回到 Redis，不破坏单激活。
 // 由于"存活键绝不重分配"，正常的扩容/滚动更新不会触发迁移。
 //
-// 启用方式：设置环境变量 KEY_XT_PLACEMENT_REDIS_ADDR 即开启；未设置时本策略
-// 完全旁路(handled=false)，回退到 Dapr 原生哈希，行为与官方一致。
+// 启用方式：设置环境变量 KEY_XT_PLACEMENT_CONFIG 指向共享配置文件(YAML，含顶层
+// placement: 段)即开启；未设置该路径、或文件里 redis_addr 为空时，本策略完全旁路
+// (handled=false)，回退到 Dapr 原生哈希，行为与官方一致。配置格式与业务侧
+// core/actor PlacementConfig 完全一致(两侧读同一份文件，保证同一 Redis / 同一 key)。
 //
 // 容错取向：一旦受管(已启用且命中策略类型)，Redis 故障不降级回原生哈希，而是返回
 // ErrActorNoAddress 让上层重试——降级会破坏 table 粘性与 room 均衡/容量约束。
@@ -59,6 +61,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"gopkg.in/yaml.v3"
 
 	"github.com/dapr/dapr/pkg/actors/api"
 	"github.com/dapr/dapr/pkg/actors/internal/placement/loops"
@@ -91,25 +94,59 @@ const (
 	// <prefix><actorType>，由外部业务进程维护(增删 roomId)。
 	defaultXuantanIdsPrefix = "xt:dapr:ids:"
 
-	// defaultXuantanTableType / defaultXuantanRoomType 各策略默认绑定的 actorType 列表
-	// (逗号分隔)；环境变量未设置时使用。
-	defaultXuantanTableType = "table_py,table"
-	defaultXuantanRoomType  = "room_py,room"
-
-	envXuantanRedisAddr   = "KEY_XT_PLACEMENT_REDIS_ADDR"     // 逗号分隔，多地址即集群/哨兵
-	envXuantanRedisPasswd = "KEY_XT_PLACEMENT_REDIS_PASSWORD" //nolint:gosec
-	envXuantanRedisDB     = "KEY_XT_PLACEMENT_REDIS_DB"
-	envXuantanKeyPrefix   = "KEY_XT_PLACEMENT_KEY_PREFIX"
-	envXuantanIdsPrefix   = "KEY_XT_PLACEMENT_IDS_PREFIX" // room 有效 id 集合(SET) key 前缀
-	envXuantanBindTTL     = "KEY_XT_PLACEMENT_BIND_TTL"   // Go duration 格式，如 "3h"、"90m"
-
-	// 各策略绑定的 actorType 集合(逗号分隔列表)：留空则该策略不接管任何类型(关闭)。
-	envXuantanTableType = "KEY_XT_PLACEMENT_STICKY_TYPE_TABLE" // 牌桌粘性策略，逗号分隔
-	envXuantanRoomType  = "KEY_XT_PLACEMENT_STICKY_TYPE_ROOM"  // 房间策略，逗号分隔
-
-	// envXuantanRoomCap 每个 host 的 room 容量上限(= pypy worker 槽数)；0/未设=不限。
-	envXuantanRoomCap = "KEY_XT_PLACEMENT_ROOM_CAP_PER_HOST"
+	// envXuantanConfig 指向共享配置文件路径(YAML，含顶层 placement: 段)；未设置=放置策略整体关闭。
+	// 配置格式与业务侧 core/actor PlacementConfig 完全一致(见 inflight_xuantan.md)，两侧读同一份文件，
+	// 保证「同一 Redis、同一 key」。原先逐项的 KEY_XT_PLACEMENT_*(redis/prefix/ttl/types/cap)已收敛进该文件。
+	envXuantanConfig = "KEY_XT_PLACEMENT_CONFIG"
 )
+
+// defaultXuantanTableType / defaultXuantanRoomType 各策略默认绑定的 actorType 列表；
+// 配置文件对应字段为空时使用。须与业务侧 core/actor 默认一致。
+var (
+	defaultXuantanTableType = []string{"table_py", "table"}
+	defaultXuantanRoomType  = []string{"room_py", "room"}
+)
+
+// xuantanConfig 共享配置文件顶层 placement: 段的解析视图；yaml key 须与业务侧 core/actor
+// PlacementConfig 完全一致(见 inflight_xuantan.md)。缺省值在 xuantanInit 里回落，与业务侧对齐。
+type xuantanConfig struct {
+	Redis           xuantanRedisConfig `yaml:"redis"`             // Redis 连接(格式同业务侧 infra.RedisConfig)
+	KeyPrefix       string             `yaml:"key_prefix"`        // 绑定 key 前缀，默认 xt:dapr:bind:
+	IdsPrefix       string             `yaml:"ids_prefix"`        // room 有效 id 集合(SET)前缀，默认 xt:dapr:ids:
+	BindTTL         string             `yaml:"bind_ttl"`          // table 绑定 TTL(Go duration)，默认 3h
+	StickyTypeTable []string           `yaml:"sticky_type_table"` // 走 table 策略的 actorType 列表
+	StickyTypeRoom  []string           `yaml:"sticky_type_room"`  // 走 room 策略的 actorType 列表
+	RoomCapPerHost  int                `yaml:"room_cap_per_host"` // 每 host room 容量上限，0/未设=不限
+}
+
+// xuantanRedisConfig 与业务侧 core/infra.RedisConfig 的 yaml 键完全一致，保证两侧共读同一份配置文件
+// 的 placement.redis 段。addresses 单条=单节点、多条=Cluster；空=放置整体关闭。
+type xuantanRedisConfig struct {
+	Addresses    []string `yaml:"addresses"`
+	Username     string   `yaml:"username"`
+	Password     string   `yaml:"password"` // nolint:gosec
+	DB           int      `yaml:"db"`
+	DialTimeout  string   `yaml:"dial_timeout"`  // Go duration，空缺省 2s
+	ReadTimeout  string   `yaml:"read_timeout"`  // Go duration，空缺省 3s
+	WriteTimeout string   `yaml:"write_timeout"` // Go duration，空缺省 3s
+	PoolSize     int      `yaml:"pool_size"`
+	MinIdleConns int      `yaml:"min_idle_conns"`
+}
+
+// loadXuantanConfig 读取共享配置文件并解出顶层 placement: 段。
+func loadXuantanConfig(path string) (xuantanConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return xuantanConfig{}, err
+	}
+	var aux struct {
+		Placement xuantanConfig `yaml:"placement"`
+	}
+	if err := yaml.Unmarshal(data, &aux); err != nil {
+		return xuantanConfig{}, err
+	}
+	return aux.Placement, nil
+}
 
 var (
 	xuantanOnce      sync.Once
@@ -230,79 +267,108 @@ return best
 `)
 
 // xuantanInit 惰性初始化 Redis 客户端与受管类型集合（进程内仅一次）。
-// 未配置 KEY_XT_PLACEMENT_REDIS_ADDR 时 xuantanRDB 保持 nil，策略整体旁路。
+// 未配置 KEY_XT_PLACEMENT_CONFIG（或文件里 redis_addr 为空 / 读取解析失败）时 xuantanRDB 保持 nil，
+// 策略整体旁路，回退 Dapr 原生哈希。
 func xuantanInit() {
 	xuantanOnce.Do(func() {
-		addr := strings.TrimSpace(os.Getenv(envXuantanRedisAddr))
-		if addr == "" {
-			log.Info("xuantan placement: disabled (no KEY_XT_PLACEMENT_REDIS_ADDR), using stock hashing")
+		path := strings.TrimSpace(os.Getenv(envXuantanConfig))
+		if path == "" {
+			log.Info("xuantan placement: disabled (no KEY_XT_PLACEMENT_CONFIG), using stock hashing")
+			return
+		}
+		cfg, err := loadXuantanConfig(path)
+		if err != nil {
+			log.Warnf("xuantan placement: load config %q failed: %v, using stock hashing", path, err)
+			return
+		}
+		addrs := xuantanTrimNonEmpty(cfg.Redis.Addresses)
+		if len(addrs) == 0 {
+			log.Info("xuantan placement: disabled (placement.redis.addresses empty), using stock hashing")
 			return
 		}
 
 		xuantanTypeKinds = nil
-		xuantanTypeKinds = xuantanAppendTypes(xuantanTypeKinds, envXuantanTableType, defaultXuantanTableType, xtKindTable)
-		xuantanTypeKinds = xuantanAppendTypes(xuantanTypeKinds, envXuantanRoomType, defaultXuantanRoomType, xtKindRoom)
+		xuantanTypeKinds = xuantanAppendTypes(xuantanTypeKinds, cfg.StickyTypeTable, defaultXuantanTableType, xtKindTable)
+		xuantanTypeKinds = xuantanAppendTypes(xuantanTypeKinds, cfg.StickyTypeRoom, defaultXuantanRoomType, xtKindRoom)
 
-		xuantanKeyPrefix = strings.TrimSpace(os.Getenv(envXuantanKeyPrefix))
+		xuantanKeyPrefix = strings.TrimSpace(cfg.KeyPrefix)
 		if xuantanKeyPrefix == "" {
 			xuantanKeyPrefix = defaultXuantanKeyPrefix
 		}
 
-		xuantanIdsPrefix = strings.TrimSpace(os.Getenv(envXuantanIdsPrefix))
+		xuantanIdsPrefix = strings.TrimSpace(cfg.IdsPrefix)
 		if xuantanIdsPrefix == "" {
 			xuantanIdsPrefix = defaultXuantanIdsPrefix
 		}
 
 		xuantanBindTTL = defaultXuantanBindTTL
-		if v := strings.TrimSpace(os.Getenv(envXuantanBindTTL)); v != "" {
+		if v := strings.TrimSpace(cfg.BindTTL); v != "" {
 			if d, err := time.ParseDuration(v); err == nil && d > 0 {
 				xuantanBindTTL = d
 			} else {
-				log.Warnf("xuantan placement: invalid %s=%q, fallback to %s", envXuantanBindTTL, v, defaultXuantanBindTTL)
+				log.Warnf("xuantan placement: invalid bind_ttl=%q, fallback to %s", v, defaultXuantanBindTTL)
 			}
 		}
 
 		xuantanRoomCapPerHost = 0
-		if v := strings.TrimSpace(os.Getenv(envXuantanRoomCap)); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-				xuantanRoomCapPerHost = n
-			} else {
-				log.Warnf("xuantan placement: invalid %s=%q, fallback to unlimited", envXuantanRoomCap, v)
-			}
-		}
-
-		db := 0
-		if v := strings.TrimSpace(os.Getenv(envXuantanRedisDB)); v != "" {
-			if n, err := strconv.Atoi(v); err == nil {
-				db = n
-			}
+		if cfg.RoomCapPerHost > 0 {
+			xuantanRoomCapPerHost = cfg.RoomCapPerHost
 		}
 
 		xuantanRDB = redis.NewUniversalClient(&redis.UniversalOptions{
-			Addrs:    strings.Split(addr, ","),
-			Password: os.Getenv(envXuantanRedisPasswd),
-			DB:       db,
+			Addrs:        addrs,
+			Username:     cfg.Redis.Username,
+			Password:     cfg.Redis.Password,
+			DB:           cfg.Redis.DB,
+			DialTimeout:  xuantanParseDur(cfg.Redis.DialTimeout, 2*time.Second),
+			ReadTimeout:  xuantanParseDur(cfg.Redis.ReadTimeout, 3*time.Second),
+			WriteTimeout: xuantanParseDur(cfg.Redis.WriteTimeout, 3*time.Second),
+			PoolSize:     cfg.Redis.PoolSize,
+			MinIdleConns: cfg.Redis.MinIdleConns,
 		})
 		go xuantanCacheGC()
 
-		log.Infof("xuantan placement: enabled, types=%v, redis=%s db=%d ttl=%s roomCap=%d bindPrefix=%q idsPrefix=%q",
-			xuantanTypeKinds, addr, db, xuantanBindTTL, xuantanRoomCapPerHost, xuantanKeyPrefix, xuantanIdsPrefix)
+		log.Infof("xuantan placement: enabled from %q, types=%v, redis=%v db=%d ttl=%s roomCap=%d bindPrefix=%q idsPrefix=%q",
+			path, xuantanTypeKinds, addrs, cfg.Redis.DB, xuantanBindTTL, xuantanRoomCapPerHost, xuantanKeyPrefix, xuantanIdsPrefix)
 	})
 }
 
-// xuantanAppendTypes 解析逗号分隔的 actorType 列表(环境变量为空时用 def)，
-// 以给定 kind 追加到映射表 dst 并返回。
-func xuantanAppendTypes(dst []xuantanTypeKind, env, def string, kind int) []xuantanTypeKind {
-	v := strings.TrimSpace(os.Getenv(env))
-	if v == "" {
-		v = def
+// xuantanParseDur 解析 Go duration 字符串，空/非法回落 fallback（与业务侧 infra.parseDur 语义一致）。
+func xuantanParseDur(s string, fallback time.Duration) time.Duration {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return fallback
 	}
-	for _, t := range strings.Split(v, ",") {
+	if d, err := time.ParseDuration(s); err == nil && d > 0 {
+		return d
+	}
+	log.Warnf("xuantan placement: invalid redis duration %q, fallback to %s", s, fallback)
+	return fallback
+}
+
+// xuantanAppendTypes 把 actorType 列表(配置为空时用 def)按 kind 追加到映射表 dst 并返回。
+func xuantanAppendTypes(dst []xuantanTypeKind, configured, def []string, kind int) []xuantanTypeKind {
+	list := configured
+	if len(list) == 0 {
+		list = def
+	}
+	for _, t := range list {
 		if t = strings.TrimSpace(t); t != "" {
 			dst = append(dst, xuantanTypeKind{typ: t, kind: kind})
 		}
 	}
 	return dst
+}
+
+// xuantanTrimNonEmpty 返回去除首尾空白、剔除空项后的列表副本。
+func xuantanTrimNonEmpty(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // xuantanKindOf 线性扫描映射表，返回 actorType 的策略种类(xtKind*)；未受管返回 0。

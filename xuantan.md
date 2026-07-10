@@ -12,14 +12,14 @@
 
 | 文件 | 改动 |
 |---|---|
-| `pkg/actors/internal/placement/loops/disseminator/inflight/inflight_xuantan.go` | **新增**：自定义放置策略（table 粘性 / room 最少负载+容量）全部实现 |
+| `pkg/actors/internal/placement/loops/disseminator/inflight/inflight_xuantan.go` | **新增**：自定义放置策略（table 粘性 / room 最少负载）全部实现 |
 | `pkg/actors/internal/placement/loops/disseminator/inflight/inflight.go` | **两行**：`New()` 调一次 `xuantanInit()`；`resolve()` 开头加 `resolveXuantan()` 钩子（`handled=false` 即回退原生哈希） |
 | `..._test.go` / `*.md` | 测试与文档 |
 
 影响面结论：
 
 - **只有 daprd 需要重建镜像**；控制面组件（placement / operator / sentry / injector / scheduler）**完全不用动**。
-- 未配置 `KEY_XT_PLACEMENT_REDIS_ADDR` 时策略整体旁路，行为与官方 daprd 完全一致——所以**升级镜像本身是零风险的**，真正启用由环境变量控制。
+- 未设置 `KEY_XT_PLACEMENT_CONFIG` 时策略整体旁路，行为与官方 daprd 完全一致——所以**升级镜像本身是零风险的**，真正启用由该环境变量控制。
 
 ---
 
@@ -89,23 +89,30 @@ dapr_sidecar_injector:
 
 > 对比：若改 `global.registry` / `global.tag` 会**同时**换掉所有控制面组件镜像，不是最小改动，不推荐。
 
-### 3.2 启用策略（给 sidecar 注入环境变量）
+### 3.2 启用策略（给 sidecar 注入配置文件路径）
 
-镜像升级后策略默认旁路；要启用，需给 daprd sidecar 注入 `KEY_XT_PLACEMENT_*` 环境变量。
-通过业务 Pod 的注解 `dapr.io/env` 注入（逗号分隔 `KEY=VALUE`）：
+镜像升级后策略默认旁路；要启用，只需给 daprd sidecar 注入**唯一环境变量** `KEY_XT_PLACEMENT_CONFIG`，
+指向一份含顶层 `placement:` 段的共享配置文件（Redis、受管类型、TTL 等所有参数都在文件里，格式见
+inflight_xuantan.md 第 3 节）。该文件与业务侧 `core/actor` 读同一份，保证「同一 Redis、同一 key」。
+
+通过业务 Pod 的注解注入环境变量并把配置文件挂进 sidecar：
 
 ```yaml
 metadata:
   annotations:
     dapr.io/enabled: "true"
     dapr.io/app-id: "game"
-    dapr.io/env: "KEY_XT_PLACEMENT_REDIS_ADDR=redis.prod:6379,KEY_XT_PLACEMENT_STICKY_TYPE_TABLE=table_py\\,table,KEY_XT_PLACEMENT_STICKY_TYPE_ROOM=room_py\\,room,KEY_XT_PLACEMENT_ROOM_CAP_PER_HOST=10"
+    dapr.io/env: "KEY_XT_PLACEMENT_CONFIG=/etc/xt/placement.yaml"
+    # 把承载配置的 ConfigMap/Volume 挂进 daprd sidecar（只读）
+    dapr.io/volume-mounts-rw: ""
+    dapr.io/volume-mounts: "xt-placement:/etc/xt"
 ```
 
 注意：
-- `dapr.io/env` 内多个变量用 `,` 分隔，故 actorType 列表里的 `,` 需转义为 `\,`（YAML 中再加一层转义即 `\\,`）。
-- **凡是承载 table/room 这些 actorType 的应用，都要带相同的环境变量并使用定制 sidecar 镜像**，否则集群内行为不一致。
-- 全部环境变量含义见 [inflight_xuantan.md 第 3 节](pkg/actors/internal/placement/loops/disseminator/inflight/inflight_xuantan.md#3-环境变量)。
+- 只需 `KEY_XT_PLACEMENT_CONFIG` 一个环境变量；原先逐项的 `KEY_XT_PLACEMENT_*`（redis/prefix/ttl/types/cap）已全部收敛进配置文件。
+- 配置文件须同时挂进 sidecar（`dapr.io/volume-mounts`）与业务容器，两侧读同一份。
+- **凡是承载 table/room 这些 actorType 的应用，都要带相同的环境变量与配置文件并使用定制 sidecar 镜像**，否则集群内行为不一致。
+- 配置文件格式与全部字段含义见 [inflight_xuantan.md 第 3 节](pkg/actors/internal/placement/loops/disseminator/inflight/inflight_xuantan.md#3-配置环境变量--共享配置文件)。
 
 ### 3.3 生效与验证
 
@@ -123,7 +130,7 @@ kubectl logs <pod> -n <ns> -c daprd | grep -i "xuantan placement"
 ### 3.4 回滚
 
 ```bash
-# 改回官方 sidecar 镜像并重启应用即可；或仅移除 KEY_XT_PLACEMENT_REDIS_ADDR 让策略旁路
+# 改回官方 sidecar 镜像并重启应用即可；或仅移除 KEY_XT_PLACEMENT_CONFIG 让策略旁路
 helm upgrade dapr dapr/dapr -n dapr-system --reuse-values \
   --set dapr_sidecar_injector.image.name=daprd
 kubectl rollout restart deploy/<your-app> -n <ns>
@@ -133,7 +140,7 @@ kubectl rollout restart deploy/<your-app> -n <ns>
 
 ## 4. 依赖与前置
 
-- 一个可达的 **Redis**（绑定表 / room 有效 id 集合的存储），地址即 `KEY_XT_PLACEMENT_REDIS_ADDR`。
+- 一个可达的 **Redis**（绑定表 / room 有效 id 集合的存储），地址在配置文件 `placement.redis.addresses`。
 - room 策略要求外部业务进程维护有效 roomId 集合 `SET xt:dapr:ids:<actorType>`（详见 inflight_xuantan.md 第 10 节）。
 - 集群节点架构与 `ARCH` 一致。
 

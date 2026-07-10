@@ -19,9 +19,9 @@ package inflight
 // 重排，已激活的 actor 可能被迁走。对"牌桌(table)"这类对局中绝不能迁移、且
 // 一局可达数分钟的场景不可接受。
 //
-// 入口 resolveXuantan 按 actorType 分发到具体子策略(两个 actorType 集合，逗号分隔)：
-//   - KEY_XT_PLACEMENT_STICKY_TYPE_TABLE 集合 -> resolveXuantanTable，牌桌粘性(本文件实现)；
-//   - KEY_XT_PLACEMENT_STICKY_TYPE_ROOM  集合 -> resolveXuantanRoom，房间策略(最少负载+容量感知)。
+// 入口 resolveXuantan 按 actorType 分发到具体子策略(受管类型来自配置文件的两个列表)：
+//   - placement.sticky_type_table 列表 -> resolveXuantanTable，牌桌粘性(本文件实现)；
+//   - placement.sticky_type_room  列表 -> resolveXuantanRoom，房间策略(最少负载)。
 //
 // 牌桌(table)策略对受管 actor 类型改为：
 //
@@ -43,12 +43,12 @@ package inflight
 // 由于"存活键绝不重分配"，正常的扩容/滚动更新不会触发迁移。
 //
 // 启用方式：设置环境变量 KEY_XT_PLACEMENT_CONFIG 指向共享配置文件(YAML，含顶层
-// placement: 段)即开启；未设置该路径、或文件里 redis_addr 为空时，本策略完全旁路
-// (handled=false)，回退到 Dapr 原生哈希，行为与官方一致。配置格式与业务侧
+// placement: 段)即开启；未设置该路径、或文件里 placement.redis.addresses 为空时，本策略
+// 完全旁路(handled=false)，回退到 Dapr 原生哈希，行为与官方一致。配置格式与业务侧
 // core/actor PlacementConfig 完全一致(两侧读同一份文件，保证同一 Redis / 同一 key)。
 //
 // 容错取向：一旦受管(已启用且命中策略类型)，Redis 故障不降级回原生哈希，而是返回
-// ErrActorNoAddress 让上层重试——降级会破坏 table 粘性与 room 均衡/容量约束。
+// ErrActorNoAddress 让上层重试——降级会破坏 table 粘性与 room 均衡。
 
 import (
 	"context"
@@ -86,7 +86,7 @@ const (
 
 	// defaultXuantanBindTTL 牌桌 actorID->host 绑定在 Redis 与本地缓存的默认存活时间。
 	// 一局通常 ~5 分钟，3 小时给足冗余；不做命中续期，TTL 仅用于自动清理。
-	// 可用 KEY_XT_PLACEMENT_BIND_TTL 覆盖(Go duration 格式，如 "3h"、"90m")。
+	// 可用配置文件 placement.bind_ttl 覆盖(Go duration 格式，如 "3h"、"90m")。
 	defaultXuantanBindTTL = 3 * time.Hour
 
 	defaultXuantanKeyPrefix = "xt:dapr:bind:"
@@ -94,9 +94,9 @@ const (
 	// <prefix><actorType>，由外部业务进程维护(增删 roomId)。
 	defaultXuantanIdsPrefix = "xt:dapr:ids:"
 
-	// envXuantanConfig 指向共享配置文件路径(YAML，含顶层 placement: 段)；未设置=放置策略整体关闭。
-	// 配置格式与业务侧 core/actor PlacementConfig 完全一致(见 inflight_xuantan.md)，两侧读同一份文件，
-	// 保证「同一 Redis、同一 key」。原先逐项的 KEY_XT_PLACEMENT_*(redis/prefix/ttl/types/cap)已收敛进该文件。
+	// envXuantanConfig 指向共享配置文件路径(YAML，含顶层 placement: 段)；本策略的唯一环境变量，
+	// 未设置=放置策略整体关闭。配置格式与业务侧 core/actor PlacementConfig 完全一致(见
+	// inflight_xuantan.md)，两侧读同一份文件，保证「同一 Redis、同一 key」。所有参数均来自该文件。
 	envXuantanConfig = "KEY_XT_PLACEMENT_CONFIG"
 )
 
@@ -116,7 +116,6 @@ type xuantanConfig struct {
 	BindTTL         string             `yaml:"bind_ttl"`          // table 绑定 TTL(Go duration)，默认 3h
 	StickyTypeTable []string           `yaml:"sticky_type_table"` // 走 table 策略的 actorType 列表
 	StickyTypeRoom  []string           `yaml:"sticky_type_room"`  // 走 room 策略的 actorType 列表
-	RoomCapPerHost  int                `yaml:"room_cap_per_host"` // 每 host room 容量上限，0/未设=不限
 }
 
 // xuantanRedisConfig 与业务侧 core/infra.RedisConfig 的 yaml 键完全一致，保证两侧共读同一份配置文件
@@ -158,9 +157,6 @@ var (
 	// 规模极小(table 至多 3、room 至多 4)，故用切片线性扫描：相比 map 省去哈希/分配，
 	// 短字符串少量比较反而更快、更省内存。空表表示无任何受管类型(整体旁路)。
 	xuantanTypeKinds []xuantanTypeKind
-
-	// xuantanRoomCapPerHost 每 host 的 room 容量上限；0=不限。由 xuantanInit 读环境变量。
-	xuantanRoomCapPerHost int
 
 	// xuantanBindTTL 实际生效的绑定 TTL，在 xuantanInit 中由环境变量初始化，
 	// 缺省/非法时回退 defaultXuantanBindTTL。
@@ -212,27 +208,25 @@ end
 return cur
 `)
 
-// xuantanRoomBindScript 房间(room)的"最少负载 + 容量感知 + 粘性"原子分配。
+// xuantanRoomBindScript 房间(room)的"最少负载 + 粘性"原子分配。
 // 全量 room 数很小(<1000)，整张绑定 hash 一次 HGETALL 在脚本内统计即可，无需独立计数器。
 //
 //	KEYS[1] = room 绑定 hash    xt:dapr:bind:<actorType>(field=<roomId>, value=hostAddr，无 TTL)
 //	KEYS[2] = 有效 roomId 集合   xt:dapr:ids:<actorType>(SET，由外部业务维护)
 //	ARGV[1] = field(本次 room 的 roomId)
-//	ARGV[2] = capPerHost(每 host 容量上限；<=0 表示不限)
-//	ARGV[3..] = 当前存活 host 地址列表(daprd 从 ring 读出)
+//	ARGV[2..] = 当前存活 host 地址列表(daprd 从 ring 读出)
 //
 // 语义：
 //   - 已有绑定且其 host 仍存活            -> 直接返回该 host(粘性，绝不迁移)；
 //   - 统计负载时顺带清理：bind 里的 roomId 若已不在 ids set(被业务删除) -> 立即 HDEL，
 //     既释放容量又自清理无效绑定；死 host 上的有效 room 不计入负载(待其被请求时重分配)；
-//   - 无绑定 / 绑定 host 已失效            -> 在"存活且未满容量"的 host 中选当前承载最少者
+//   - 无绑定 / 绑定 host 已失效            -> 在存活 host 中选当前承载最少者
 //     (平手按地址名定序)，HSET 覆盖写入并返回；
-//   - 所有存活 host 均已满              -> 返回 ”，由上层报错重试。
+//   - 无存活 host                        -> 返回 ”，由上层报错重试。
 var xuantanRoomBindScript = redis.NewScript(`
 local field = ARGV[1]
-local cap = tonumber(ARGV[2])
 local alive = {}
-for i = 3, #ARGV do alive[ARGV[i]] = 0 end
+for i = 2, #ARGV do alive[ARGV[i]] = 0 end
 
 local cur = redis.call('HGET', KEYS[1], field)
 if cur and alive[cur] ~= nil then
@@ -251,14 +245,12 @@ for i = 1, #all, 2 do
 end
 
 local best, bestCount
-for i = 3, #ARGV do
+for i = 2, #ARGV do
     local h = ARGV[i]
     local c = alive[h]
-    if cap <= 0 or c < cap then
-        if best == nil or c < bestCount or (c == bestCount and h < best) then
-            best = h
-            bestCount = c
-        end
+    if best == nil or c < bestCount or (c == bestCount and h < best) then
+        best = h
+        bestCount = c
     end
 end
 if best == nil then return '' end
@@ -267,7 +259,7 @@ return best
 `)
 
 // xuantanInit 惰性初始化 Redis 客户端与受管类型集合（进程内仅一次）。
-// 未配置 KEY_XT_PLACEMENT_CONFIG（或文件里 redis_addr 为空 / 读取解析失败）时 xuantanRDB 保持 nil，
+// 未配置 KEY_XT_PLACEMENT_CONFIG（或文件里 placement.redis.addresses 为空 / 读取解析失败）时 xuantanRDB 保持 nil，
 // 策略整体旁路，回退 Dapr 原生哈希。
 func xuantanInit() {
 	xuantanOnce.Do(func() {
@@ -310,11 +302,6 @@ func xuantanInit() {
 			}
 		}
 
-		xuantanRoomCapPerHost = 0
-		if cfg.RoomCapPerHost > 0 {
-			xuantanRoomCapPerHost = cfg.RoomCapPerHost
-		}
-
 		xuantanRDB = redis.NewUniversalClient(&redis.UniversalOptions{
 			Addrs:        addrs,
 			Username:     cfg.Redis.Username,
@@ -328,8 +315,8 @@ func xuantanInit() {
 		})
 		go xuantanCacheGC()
 
-		log.Infof("xuantan placement: enabled from %q, types=%v, redis=%v db=%d ttl=%s roomCap=%d bindPrefix=%q idsPrefix=%q",
-			path, xuantanTypeKinds, addrs, cfg.Redis.DB, xuantanBindTTL, xuantanRoomCapPerHost, xuantanKeyPrefix, xuantanIdsPrefix)
+		log.Infof("xuantan placement: enabled from %q, types=%v, redis=%v db=%d ttl=%s bindPrefix=%q idsPrefix=%q",
+			path, xuantanTypeKinds, addrs, cfg.Redis.DB, xuantanBindTTL, xuantanKeyPrefix, xuantanIdsPrefix)
 	})
 }
 
@@ -495,11 +482,11 @@ func (i *Inflight) resolveXuantanTable(req *api.LookupActorRequest) (*api.Lookup
 	return nil, true, messages.ErrActorNoAddress.WithFormat(req.ActorKey())
 }
 
-// resolveXuantanRoom 房间(room)放置策略：最少负载 + 容量感知 + 粘性不迁移、无 TTL。
+// resolveXuantanRoom 房间(room)放置策略：最少负载 + 粘性不迁移、无 TTL。
 //
 // 与 table 的差异：
-//   - 选址不用一致性哈希(roomId 是 <1000 的稀疏小集合，哈希会失衡，且 1 room=1 pypy
-//     worker，每 host 有硬容量上限)，改为在存活且未满的 host 中选"当前承载最少者"；
+//   - 选址不用一致性哈希(roomId 是 <1000 的稀疏小集合，哈希会失衡)，改为在存活 host
+//     中选"当前承载最少者"；
 //   - 绑定无 TTL，常驻；清理靠 host 失效时的重分配，或外部 roomId owner 进程 HDEL；
 //   - 扩容(新 host)不自动迁移既有 room，新容量仅承接后续(重)分配，随失效逐步均衡。
 //
@@ -533,22 +520,22 @@ func (i *Inflight) resolveXuantanRoom(req *api.LookupActorRequest) (*api.LookupA
 	hashKey := xuantanKeyPrefix + req.ActorType // 每 actorType 一张绑定 hash，无 TTL
 	idsKey := xuantanIdsPrefix + req.ActorType  // 外部业务维护的有效 roomId 集合(SET)
 
-	argv := make([]interface{}, 0, len(hosts)+2)
-	argv = append(argv, req.ActorID, strconv.Itoa(xuantanRoomCapPerHost)) // field=roomId
+	argv := make([]interface{}, 0, len(hosts)+1)
+	argv = append(argv, req.ActorID) // field=roomId
 	for _, h := range hosts {
 		argv = append(argv, h)
 	}
 	res, err := xuantanRoomBindScript.Run(ctx, xuantanRDB, []string{hashKey, idsKey}, argv...).Result()
 	if err != nil {
-		// Redis 故障：不降级到原生哈希(哈希会失衡/超容)，返回可重试错误等待重试。
+		// Redis 故障：不降级到原生哈希(哈希会失衡)，返回可重试错误等待重试。
 		msg := fmt.Sprintf("xuantan placement: %s room bind failed: %v", req.ActorKey(), err)
 		log.Warn(msg)
 		return nil, true, messages.ErrActorNoAddress.WithFormat(msg)
 	}
 	name, _ := res.(string)
 	if name == "" {
-		// 所有存活 host 均已满容量：报可重试错误，等待扩容/有 room 释放后重试。
-		log.Warnf("xuantan placement: %s no host under cap=%d (alive=%d)", req.ActorKey(), xuantanRoomCapPerHost, len(hosts))
+		// 无存活 host 可选（并发下 ring 变空等边界）：报可重试错误，下次重选。
+		log.Warnf("xuantan placement: %s no alive host (alive=%d)", req.ActorKey(), len(hosts))
 		return nil, true, messages.ErrActorNoAddress.WithFormat(req.ActorKey())
 	}
 

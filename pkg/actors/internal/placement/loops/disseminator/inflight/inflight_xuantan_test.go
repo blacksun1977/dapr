@@ -103,7 +103,6 @@ func xtSetup(c redis.UniversalClient) {
 	xuantanKeyPrefix = "xt:dapr:bind:"
 	xuantanIdsPrefix = "xt:dapr:ids:"
 	xuantanBindTTL = 3 * time.Hour
-	xuantanRoomCapPerHost = 0
 	xuantanTypeKinds = []xuantanTypeKind{{typ: "table", kind: xtKindTable}, {typ: "room", kind: xtKindRoom}}
 	xtClearCache()
 }
@@ -296,34 +295,6 @@ func TestXuantanRoomBalanced(t *testing.T) {
 	}
 	assert.LessOrEqualf(t, mx-mn, 1, "imbalanced: %+v", counts)
 	assert.Equal(t, n, counts[hosts[0]]+counts[hosts[1]]+counts[hosts[2]])
-}
-
-// room：容量上限生效，超额返回可重试错误。
-func TestXuantanRoomCapacity(t *testing.T) {
-	ctx := context.Background()
-	c := xtRedis(t)
-	defer c.Close()
-	xtSetup(c)
-	xuantanRoomCapPerHost = 2 // 2 host * cap2 = 4 槽
-
-	hosts := []string{"c1:9", "c2:9"}
-	in := xtInflight("room", xtRing(hosts...))
-	for i := 1; i <= 5; i++ {
-		require.NoError(t, c.SAdd(ctx, "xt:dapr:ids:room", strconv.Itoa(i)).Err())
-	}
-
-	for i := 1; i <= 4; i++ {
-		resp, handled, err := in.resolveXuantanRoom(xtReq("room", strconv.Itoa(i)))
-		require.Truef(t, handled, "room %d", i)
-		require.NoErrorf(t, err, "room %d", i)
-		require.NotNilf(t, resp, "room %d", i)
-	}
-
-	// 第 5 个：全满
-	resp, handled, err := in.resolveXuantanRoom(xtReq("room", "5"))
-	assert.True(t, handled)
-	assert.Nil(t, resp)
-	assert.Error(t, err)
 }
 
 // room：统计时清理不在 ids set 的无效绑定。

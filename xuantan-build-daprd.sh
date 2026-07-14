@@ -19,7 +19,7 @@
 #   IMAGE_NAME  镜像名(默认 daprd)
 #   TAG         镜像 tag(默认 xt-<时间戳>)
 #   ARCHS       目标架构列表(默认 "amd64 arm64")
-#   BUILDER     buildx builder 名称(默认 xuantan-builder)
+#   BUILDER     buildx builder 名称(默认 poker)
 #   PUSH        是否推送(默认 false)
 #
 set -euo pipefail
@@ -29,7 +29,7 @@ REGISTRY="harbor.ops.tuyoops.com/xuantan"
 IMAGE_NAME="${IMAGE_NAME:-daprd}"
 TAG="${TAG:-xt.1.15.4}"
 ARCHS="${ARCHS:-amd64 arm64}"
-BUILDER="${BUILDER:-xuantan-builder}"
+BUILDER="${BUILDER:-poker}"
 PUSH="${PUSH:-false}"
 
 if [[ -z "${REGISTRY}" ]]; then

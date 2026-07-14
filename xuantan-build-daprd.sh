@@ -27,7 +27,7 @@ cd "$(dirname "$0")"
 
 REGISTRY="harbor.ops.tuyoops.com/xuantan"
 IMAGE_NAME="${IMAGE_NAME:-daprd}"
-TAG="${TAG:-xt-$(date +%Y%m%d-%H%M%S)}"
+TAG="${TAG:-xt.1.15.4}"
 ARCHS="${ARCHS:-amd64 arm64}"
 BUILDER="${BUILDER:-xuantan-builder}"
 PUSH="${PUSH:-false}"
@@ -75,7 +75,7 @@ fi
 docker buildx build \
   --builder "${BUILDER}" \
   --platform "${PLATFORMS}" \
-  ${OUTPUT_FLAG} \
+  --push \
   -t "${IMAGE}" \
   -f - \
   dist <<'DOCKERFILE'

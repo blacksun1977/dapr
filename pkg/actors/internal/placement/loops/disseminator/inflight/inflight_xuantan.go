@@ -20,8 +20,8 @@ package inflight
 // 一局可达数分钟的场景不可接受。
 //
 // 入口 resolveXuantan 按 actorType 分发到具体子策略(受管类型来自配置文件的两个列表)：
-//   - placement.sticky_type_table 列表 -> resolveXuantanTable，牌桌粘性(本文件实现)；
-//   - placement.sticky_type_room  列表 -> resolveXuantanRoom，房间策略(最少负载)。
+//   - dapr.sticky_type_table 列表 -> resolveXuantanTable，牌桌粘性(本文件实现)；
+//   - dapr.sticky_type_room  列表 -> resolveXuantanRoom，房间策略(最少负载)。
 //
 // 牌桌(table)策略对受管 actor 类型改为：
 //
@@ -43,9 +43,9 @@ package inflight
 // 由于"存活键绝不重分配"，正常的扩容/滚动更新不会触发迁移。
 //
 // 启用方式：设置环境变量 KEY_XT_PLACEMENT_CONFIG 指向共享配置文件(YAML，含顶层
-// placement: 段)即开启；未设置该路径、或文件里 placement.redis.addresses 为空时，本策略
+// dapr: 段)即开启；未设置该路径、或文件里 dapr.redis.addresses 为空时，本策略
 // 完全旁路(handled=false)，回退到 Dapr 原生哈希，行为与官方一致。配置格式与业务侧
-// core/actor PlacementConfig 完全一致(两侧读同一份文件，保证同一 Redis / 同一 key)。
+// core/etc DaprConfig 完全一致(两侧读同一份文件，保证同一 Redis / 同一 key)。
 //
 // 容错取向：一旦受管(已启用且命中策略类型)，Redis 故障不降级回原生哈希，而是返回
 // ErrActorNoAddress 让上层重试——降级会破坏 table 粘性与 room 均衡。
@@ -94,8 +94,8 @@ const (
 	// <prefix><actorType>，由外部业务进程维护(增删 roomId)。
 	defaultXuantanIdsPrefix = "xt:dapr:ids:"
 
-	// envXuantanConfig 指向共享配置文件路径(YAML，含顶层 placement: 段)；本策略的唯一环境变量，
-	// 未设置=放置策略整体关闭。配置格式与业务侧 core/actor PlacementConfig 完全一致(见
+	// envXuantanConfig 指向共享配置文件路径(YAML，含顶层 dapr: 段)；本策略的唯一环境变量，
+	// 未设置=放置策略整体关闭。配置格式与业务侧 core/etc DaprConfig 完全一致(见
 	// inflight_xuantan.md)，两侧读同一份文件，保证「同一 Redis、同一 key」。所有参数均来自该文件。
 	envXuantanConfig = "KEY_XT_PLACEMENT_CONFIG"
 )
@@ -107,8 +107,8 @@ var (
 	defaultXuantanRoomType  = []string{"room_py", "room"}
 )
 
-// xuantanConfig 共享配置文件顶层 placement: 段的解析视图；yaml key 须与业务侧 core/actor
-// PlacementConfig 完全一致(见 inflight_xuantan.md)。缺省值在 xuantanInit 里回落，与业务侧对齐。
+// xuantanConfig 共享配置文件顶层 dapr: 段的解析视图；yaml key 须与业务侧 core/etc
+// DaprConfig 完全一致(见 inflight_xuantan.md)。缺省值在 xuantanInit 里回落，与业务侧对齐。
 type xuantanConfig struct {
 	Redis           xuantanRedisConfig `yaml:"redis"`             // Redis 连接(格式同业务侧 infra.RedisConfig)
 	KeyPrefix       string             `yaml:"key_prefix"`        // 绑定 key 前缀，默认 xt:dapr:bind:
@@ -119,7 +119,7 @@ type xuantanConfig struct {
 }
 
 // xuantanRedisConfig 与业务侧 core/infra.RedisConfig 的 yaml 键完全一致，保证两侧共读同一份配置文件
-// 的 placement.redis 段。addresses 单条=单节点、多条=Cluster；空=放置整体关闭。
+// 的 dapr.redis 段。addresses 单条=单节点、多条=Cluster；空=放置整体关闭。
 type xuantanRedisConfig struct {
 	Addresses    []string `yaml:"addresses"`
 	Username     string   `yaml:"username"`
@@ -132,19 +132,19 @@ type xuantanRedisConfig struct {
 	MinIdleConns int      `yaml:"min_idle_conns"`
 }
 
-// loadXuantanConfig 读取共享配置文件并解出顶层 placement: 段。
+// loadXuantanConfig 读取共享配置文件并解出顶层 dapr: 段。
 func loadXuantanConfig(path string) (xuantanConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return xuantanConfig{}, err
 	}
 	var aux struct {
-		Placement xuantanConfig `yaml:"placement"`
+		Dapr xuantanConfig `yaml:"dapr"`
 	}
 	if err := yaml.Unmarshal(data, &aux); err != nil {
 		return xuantanConfig{}, err
 	}
-	return aux.Placement, nil
+	return aux.Dapr, nil
 }
 
 var (
@@ -259,7 +259,7 @@ return best
 `)
 
 // xuantanInit 惰性初始化 Redis 客户端与受管类型集合（进程内仅一次）。
-// 未配置 KEY_XT_PLACEMENT_CONFIG（或文件里 placement.redis.addresses 为空 / 读取解析失败）时 xuantanRDB 保持 nil，
+// 未配置 KEY_XT_PLACEMENT_CONFIG（或文件里 dapr.redis.addresses 为空 / 读取解析失败）时 xuantanRDB 保持 nil，
 // 策略整体旁路，回退 Dapr 原生哈希。
 func xuantanInit() {
 	xuantanOnce.Do(func() {
@@ -275,7 +275,7 @@ func xuantanInit() {
 		}
 		addrs := xuantanTrimNonEmpty(cfg.Redis.Addresses)
 		if len(addrs) == 0 {
-			log.Info("xuantan placement: disabled (placement.redis.addresses empty), using stock hashing")
+			log.Info("xuantan placement: disabled (dapr.redis.addresses empty), using stock hashing")
 			return
 		}
 

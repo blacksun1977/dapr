@@ -34,26 +34,26 @@ host。这对两类业务不可接受：
 - **返回约定**：`(resp, handled, err)`
     - `handled=false`：本策略不接管（未启用 / 非受管类型），调用方继续走原生哈希。
     - `handled=true`：本策略给出结果（`resp` 或 `err` 之一有效）。**Redis 故障也走此分支**，返回 `ErrActorNoAddress`（可重试），不降级回原生哈希。
-- **启用开关**：设置 `KEY_XT_PLACEMENT_CONFIG` 指向共享配置文件（含顶层 `placement:` 段）即开启；未设置该路径、
-  文件读取/解析失败、或文件里 `placement.redis.addresses` 为空时 `xuantanRDB == nil`，整体旁路，行为与官方一致。
+- **启用开关**：设置 `KEY_XT_PLACEMENT_CONFIG` 指向共享配置文件（含顶层 `dapr:` 段）即开启；未设置该路径、
+  文件读取/解析失败、或文件里 `dapr.redis.addresses` 为空时 `xuantanRDB == nil`，整体旁路，行为与官方一致。
 
 ## 3. 配置（环境变量 + 共享配置文件）
 
-daprd 只认一个环境变量——配置文件路径；所有参数都来自该文件的 `placement:` 段。**该文件由 daprd 与业务侧
-（`core/actor` 的 `PlacementConfig`）共读同一份**，保证两侧「同一 Redis、同一 key」。
+daprd 只认一个环境变量——配置文件路径；所有参数都来自该文件的 `dapr:` 段。**该文件由 daprd 与业务侧
+（`core/etc` 的 `DaprConfig`）共读同一份**，保证两侧「同一 Redis、同一 key」。
 
 | 环境变量                   | 含义                                          | 默认值    |
 |------------------------|---------------------------------------------|--------|
-| `KEY_XT_PLACEMENT_CONFIG` | 共享配置文件路径（YAML，含顶层 `placement:` 段）。**未设置=整个策略关闭** | 空（关闭） |
+| `KEY_XT_PLACEMENT_CONFIG` | 共享配置文件路径（YAML，含顶层 `dapr:` 段）。**未设置=整个策略关闭** | 空（关闭） |
 
-### 3.1 配置文件格式（YAML，顶层 `placement:` 段）
+### 3.1 配置文件格式（YAML，顶层 `dapr:` 段）
 
-业务侧 actor 进程配置文件与 daprd 复用同一份；`placement:` 段字段与 `core/actor.PlacementConfig` 的 yaml
+业务侧 actor 进程配置文件与 daprd 复用同一份；`dapr:` 段字段与 `core/etc.DaprConfig` 的 yaml
 tag 完全一致，其中 `redis:` 子段格式与业务其余 Redis 配置 `core/infra.RedisConfig` 一致：
 
 ```yaml
-# 业务侧 actor 进程还会读同文件的 actor: 段；daprd 只读 placement: 段。
-placement:
+# 业务侧 actor 进程还会读同文件的 actor: 段；daprd 只读 dapr: 段（call_timeout 为业务出站专用，daprd 忽略）。
+dapr:
   redis:                         # Redis 连接（格式同 core/infra.RedisConfig）
     addresses:                   # 地址列表：单条=单节点、多条=Cluster；为空=整个策略关闭
       - "127.0.0.1:6379"
@@ -89,7 +89,7 @@ placement:
 > daprd 侧读同样的 `redis:` 键、按相同语义构造 `redis.UniversalClient`。
 
 > 缺省值在 daprd 侧 `xuantanInit` 与业务侧 `manager` 各自回落，两侧保持一致。业务侧的读写入口见
-> `core/actor` 的 `IManager.GetPlacementBinding` / `SetPlacementBinding`（Redis 连接按 `PlacementConfig`
+> `core/actor` 的 `IManager.GetPlacementBinding` / `SetPlacementBinding`（Redis 连接按 `DaprConfig`
 > 延迟建立、进程内复用）。
 >
 > actorType 集合非常小（table ≤3、room ≤4），内部合并成一张带 `kind` 标记的切片 `xuantanTypeKinds`，用**线性扫描**（
@@ -102,7 +102,7 @@ placement:
 ```
 key   = <KEY_PREFIX><actorType>:<actorID>     例: xt:dapr:bind:table:123456
 value = <hostAddr>
-TTL   = placement.bind_ttl（默认 3h）
+TTL   = dapr.bind_ttl（默认 3h）
 ```
 
 ### 4.2 room（每个 actorType 一张 hash + 一个外部维护的 SET）
@@ -263,7 +263,7 @@ daprd 侧不负责增删 ids SET，只读取它做有效性校验与自清理。
 |--------------|-------------------------------------------|
 | Redis 操作超时   | `2s`                                      |
 | 本地缓存 GC 周期   | `1min`                                    |
-| table 绑定 TTL | `placement.bind_ttl`，默认 `3h`，不续期   |
+| table 绑定 TTL | `dapr.bind_ttl`，默认 `3h`，不续期   |
 | room 绑定 TTL  | 无（常驻，靠重分配/ids 清理）                         |
 | table 单激活    | Lua CAS（SET NX / 旧值匹配覆盖）                  |
 | room 单激活     | 单条 Lua（HGET 粘性 + 最少负载 HSET）               |

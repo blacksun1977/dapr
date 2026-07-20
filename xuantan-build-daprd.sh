@@ -88,6 +88,7 @@ DOCKERFILE
 
 echo
 echo "完成。"
+docker pull "${IMAGE}"
 if [[ "${PUSH}" == "true" ]]; then
   echo "多架构 sidecar 镜像 (${PLATFORMS}) = ${IMAGE}"
 else

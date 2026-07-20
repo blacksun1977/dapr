@@ -20,7 +20,7 @@
 #   TAG         镜像 tag(默认 xt-<时间戳>)
 #   ARCHS       目标架构列表(默认 "amd64 arm64")
 #   BUILDER     buildx builder 名称(默认 poker)
-#   PUSH        是否推送(默认 false)
+#   PUSH        是否推送(默认 true)
 #
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -30,7 +30,7 @@ IMAGE_NAME="${IMAGE_NAME:-daprd}"
 TAG="${TAG:-xt.1.15.4}"
 ARCHS="${ARCHS:-amd64 arm64}"
 BUILDER="${BUILDER:-poker}"
-PUSH="${PUSH:-false}"
+PUSH="${PUSH:-true}"
 
 if [[ -z "${REGISTRY}" ]]; then
   echo "ERROR: 请设置 REGISTRY, 例如 REGISTRY=registry.example.com/dapr" >&2

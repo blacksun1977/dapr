@@ -119,49 +119,66 @@ TTL   = dapr.bind_ttl（默认 3h）
 
 ## 5. table 策略（`resolveXuantanTable`）
 
-特点：**初次哈希分配 → 持久化 → 粘性不迁移 → host 失效才重分配**。
+特点：**有效性门禁 → 初次哈希分配 → 持久化 → 粘性不迁移 → host 失效即拒绝(绝不迁移)**。
+
+**有效性门禁**：牌桌必须先被业务预标记为有效才能分配 host。业务在**预建牌桌实例之前**把绑定 key 置为有效标记
+`"1"`（`core.IManager.MarkTableValid`，SET 带 TTL）；daprd 分配时：
+
+- 绑定 key **不存在**（未预标记 / 标记已过期）→ 视为无效 tableId，返回哨兵 → 上层报错，**绝不分配 host**；
+- 绑定 key 值为 **`"1"`**（已预标记待分配）→ 门禁通过，进入分配（CAS `"1"` → host）；
+- 绑定 key 值为**存活 host** → 已分配，粘性返回；
+- 绑定 key 值为**失效 host / 脏值** → 无效（牌桌绝不迁移，host 失效即这局不可恢复）→ 报错。
+
+> 与旧版差异：旧版“key 不存在即 SET NX 建绑定”会给任意 tableId 凭空激活牌桌；现要求业务先 `MarkTableValid`。
+> 有效性门禁只在（分配/未命中）路径判定；本地缓存命中(已分配且 host 存活)时零 Redis、直接返回。
 
 流程：
 
 ```
 ⓪ 本地缓存命中且 host 在 ring 内(存活) 且未过期(≤TTL)  → 直接返回（热路径零 Redis）
 ① GET 绑定
-   - 存在且 host 存活 → 回填缓存，返回（粘住，不续期 TTL）
-   - 存在但 host 失效 → 记 prev，转 ② 做 CAS 重分配
-   - Redis 故障(非 Nil) → 记日志，handled=true + ErrActorNoAddress(可重试，不降级)
-   - 无绑定           → prev=""
+   - key 不存在(redis.Nil) → 未预标记 => 无效 tableId，handled=true + ErrActorNoAddress
+   - Redis 故障           → 记日志，handled=true + ErrActorNoAddress(可重试，不降级)
+   - 值为存活 host        → 回填缓存，返回（粘住，不续期 TTL）
+   - 值 != "1"(失效 host/脏值) → 无效，handled=true + ErrActorNoAddress（不迁移、不重分配）
+   - 值 == "1"(有效标记)  → 转 ② 分配
 ② ring.GetHost(actorID) 用一致性哈希选新 host
-③ Lua CAS 原子写入（xuantanBindScript）：
-   - key 不存在        → SET（等价 NX）写 newHost
-   - 当前值==prev      → 覆盖为 newHost（失效重分配）
+③ Lua CAS 原子写入（xuantanBindScript，expectedOld="1"）：
+   - key 不存在        → 返回哨兵（标记已过期）→ 上层报无效
+   - 当前值=="1"       → 覆盖为 newHost（分配）
    - 否则(被他人抢写)  → 返回既有权威值
 ④ 采用权威绑定，回填本地缓存并返回
 ```
 
-`xuantanBindScript`（CAS 创建/替换）：
+`xuantanBindScript`（有效标记 CAS 分配）：
 
 ```lua
--- KEYS[1]=bindKey  ARGV[1]=expectedOld(新建传"")  ARGV[2]=newHost  ARGV[3]=ttl秒
+-- KEYS[1]=bindKey  ARGV[1]=expectedOld(分配传有效标记"1")  ARGV[2]=newHost  ARGV[3]=ttl秒
 local cur = redis.call('GET', KEYS[1])
-if cur == false then redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3]); return ARGV[2] end
+if cur == false then return '\0xt-not-member' end            -- 未预标记 => 无效(不建绑定)
 if cur == ARGV[1] then redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3]); return ARGV[2] end
 return cur
 ```
 
+**谁写有效标记**：游戏业务分配 tid（`Mesh().Sequence().NextId("table")`）后、`create.table.ins` 预建牌桌实例
+之前，调 `MarkTableValid(ActorTypeBattlePy, tid)` 写入 `"1"`（见 `game/worker/pypy/create_table.go`）。
+
 **TTL 策略**：绑定与本地缓存条目均为 `BIND_TTL`，且**不做命中续期**——TTL 仅用于无人值守的自动清理。约束：`actor 存活时长 < TTL`
-。牌桌一局 ~5 分钟，远小于 3h，绝不会在对局期间过期。
+。牌桌一局 ~5 分钟，远小于 3h，绝不会在对局期间过期。有效标记 `"1"` 也用同一 TTL 写入，覆盖“预标记→首次分配”窗口。
 
 ## 6. room 策略（`resolveXuantanRoom`）
 
-特点：**最少负载 + 粘性不迁移 + 无 TTL**。
+特点：**有效性门禁 + 最少负载 + 粘性不迁移 + 无 TTL**。
 
 流程：
 
 ```
-⓪ 本地缓存命中且 host 存活        → 直接返回（room 只按 ring 判活，不按时间过期）
+⓪ 本地缓存命中且 host 存活        → 直接返回（已分配即已通过门禁；零 Redis，不再校验）
    枚举 ring 内所有存活 host 作为候选集（xuantanRingHosts）
    候选为空 → ErrActorNoAddress（可重试）
    调用 Lua（xuantanRoomBindScript），传入 roomId、存活 host 列表：
+     - 有效性门禁（仅在此分配/未命中路径）：roomId 不在 ids SET → 返回哨兵
+       → 上层报 ErrActorNoAddress（无效房间，不建绑定、不激活）
      - 现绑定 host 存活            → 直接返回（粘性）
      - 顺带清理：bind 中的 roomId 不在 ids SET → 立即 HDEL（自清理）
      - 在存活 host 中选承载最少者(平手按地址名定序) → HSET 写入
@@ -176,6 +193,10 @@ return cur
 -- KEYS[1]=bind hash(xt:dapr:bind:<type>)  KEYS[2]=ids set(xt:dapr:ids:<type>)
 -- ARGV[1]=roomId  ARGV[2..]=存活 host 列表
 local field = ARGV[1]
+if redis.call('SISMEMBER', KEYS[2], field) == 0 then
+    return '\0xt-not-member'                              -- 门禁：无效 roomId，不分配（哨兵）
+end
+
 local alive = {}
 for i = 2, #ARGV do alive[ARGV[i]] = 0 end
 
@@ -228,8 +249,9 @@ bind 字段 `HDEL`，减轻对应 host 负载并自清理。
 ## 8. 单激活与一致性保证
 
 - **唯一权威**：Redis 绑定（table 的 string / room 的 hash 字段）是全集群唯一权威。
-- **原子收敛**：table 用 “SET NX / 仅当旧值匹配才覆盖” 的 Lua CAS；room 用单条 Lua（HGET 粘性 + HGETALL 统计 +
-  HSET）原子完成。并发的多个 daprd 收敛到同一 host。
+- **原子收敛**：table 用 “有效标记 `"1"` CAS（仅当值仍为 `"1"` 才覆盖为 host）” 的 Lua；room 用单条 Lua（HGET 粘性 +
+  HGETALL 统计 + HSET）原子完成。并发的多个 daprd 收敛到同一 host。
+- **有效性门禁**：table 要求业务先 `MarkTableValid` 预标记（key 不存在即无效）；room 要求 roomId 在 ids SET 内。
 - **判活复核**：本地缓存每次都用 `xuantanRingHost`（`ring.ReadInternals` 读 `loadMap`）复核存活，host 一旦失效立即弃缓存回
   Redis，不破坏单激活。
 - **存活键绝不重分配** → 正常扩容/滚动更新不触发迁移。
@@ -246,7 +268,9 @@ bind 字段 `HDEL`，减轻对应 host 负载并自清理。
 
 > 单次 Redis 操作超时 `xuantanRedisOpTimeout = 2s`，避免抖动阻塞热路径。
 
-## 10. 外部业务约定（room）
+## 10. 外部业务约定
+
+### room（有效 roomId 集合）
 
 外部进程作为 roomId 的 owner，需把**全量有效 roomId** 维护到 SET：
 
@@ -257,6 +281,16 @@ SREM xt:dapr:ids:<actorType> <roomId>        # 删除（绑定会在下次重分
 
 daprd 侧不负责增删 ids SET，只读取它做有效性校验与自清理。
 
+### table（有效牌桌预标记）
+
+业务在**预建牌桌实例之前**把绑定 key 预标记为有效（值 `"1"`）：
+
+```
+SET xt:dapr:bind:<actorType>:<tableId> 1 EX <bind_ttl>   # 预标记有效（core.IManager.MarkTableValid）
+```
+
+daprd 分配时把 `"1"` CAS 覆盖为实际 host；未预标记（key 不存在）的 tableId 一律拒绝分配。
+
 ## 11. 关键参数小结
 
 | 项            | 取值                                        |
@@ -265,5 +299,6 @@ daprd 侧不负责增删 ids SET，只读取它做有效性校验与自清理。
 | 本地缓存 GC 周期   | `1min`                                    |
 | table 绑定 TTL | `dapr.bind_ttl`，默认 `3h`，不续期   |
 | room 绑定 TTL  | 无（常驻，靠重分配/ids 清理）                         |
-| table 单激活    | Lua CAS（SET NX / 旧值匹配覆盖）                  |
+| table 有效性门禁 | 业务 `MarkTableValid` 预标记 `"1"`（未标记即拒绝）      |
+| table 单激活    | Lua CAS（仅当值为 `"1"` 才覆盖为 host）              |
 | room 单激活     | 单条 Lua（HGET 粘性 + 最少负载 HSET）               |

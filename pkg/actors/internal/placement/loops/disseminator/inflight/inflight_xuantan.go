@@ -25,11 +25,14 @@ package inflight
 //
 // 牌桌(table)策略对受管 actor 类型改为：
 //
-//	① 首次分配：用 Dapr 现有的一致性哈希选一个 host；
-//	② 持久化：把 actorID -> host(地址) 原子写入 Redis，TTL 3 小时；
+//	⓪ 有效性门禁：分配前先看绑定 key 是否被业务预标记为有效——业务在预建牌桌实例前把
+//	   绑定 key 置为有效标记 "1"(见 core.IManager.MarkTableValid)；key 不存在(未预标记)
+//	   即视为无效 tableId，直接返回异常，绝不分配 host。杜绝任意 tableId 凭空激活牌桌；
+//	① 首次分配：门禁通过(值为 "1")后，用 Dapr 现有的一致性哈希选一个 host；
+//	② 持久化：以 CAS(仅当值仍为 "1") 把 actorID -> host(地址) 原子写入 Redis，TTL 3 小时；
 //	③ 粘性：只要绑定的 host 仍在当前成员表(hash ring)里(存活)，就一直返回它，不重新分配；
-//	④ 失效重分配：仅当绑定的 host 从成员表消失(失效)时，才用哈希重新选一个 host
-//	   并以 CAS 方式原子替换 Redis 中的绑定。
+//	④ host 失效：绑定的 host 从成员表消失(失效)即视为无效(牌桌绝不迁移、亦不重分配到新 host)，
+//	   返回异常——host 失效意味着这局牌桌已不可恢复。
 //
 // 性能：热路径用进程内本地缓存(i.xuantanCache) + ring 本地判活兜底——命中且 host
 // 存活时零 Redis；仅在"本地未缓存 / 缓存过期 / 绑定 host 失效"时才访问 Redis。
@@ -37,10 +40,10 @@ package inflight
 // TTL：Redis 绑定与本地缓存条目均为 3 小时，且【不做命中续期】——TTL 仅用于自动
 // 清理。牌桌一局 ~5 分钟，远小于 TTL，绝不会在对局期间过期(约束:actor 存活 < TTL)。
 //
-// 单激活保证：Redis 绑定是全集群唯一权威；首次写用 SET NX、失效替换用
-// "仅当旧值匹配才覆盖"的 Lua CAS，确保并发的多个 daprd 收敛到同一个 host。
-// 本地缓存每次都用 ring 复核存活，host 一旦失效即弃用缓存回到 Redis，不破坏单激活。
-// 由于"存活键绝不重分配"，正常的扩容/滚动更新不会触发迁移。
+// 单激活保证：Redis 绑定是全集群唯一权威；首次分配用"仅当值仍为有效标记 '1' 才覆盖"的
+// Lua CAS，确保并发的多个 daprd 收敛到同一个 host。本地缓存每次都用 ring 复核存活，
+// host 一旦失效即弃用缓存回到 Redis，不破坏单激活。由于"存活键绝不重分配"，正常的
+// 扩容/滚动更新不会触发迁移。
 //
 // 启用方式：设置环境变量 KEY_XT_PLACEMENT_CONFIG 指向共享配置文件(YAML，含顶层
 // dapr: 段)即开启；未设置该路径、或文件里 dapr.redis.addresses 为空时，本策略
@@ -77,7 +80,7 @@ const (
 
 const (
 	// xuantanRedisOpTimeout 单次 Redis 操作超时；resolve 在热路径上，超时即异常
-	xuantanRedisOpTimeout = 2 * time.Second
+	xuantanRedisOpTimeout = 3 * time.Second
 
 	// xuantanCacheGCInterval 本地缓存过期清理周期。
 	// resolve 已对单条做惰性失效(命中时判 TTL/判活)，此处只为回收"再也不会被访问"
@@ -85,9 +88,9 @@ const (
 	xuantanCacheGCInterval = time.Minute
 
 	// defaultXuantanBindTTL 牌桌 actorID->host 绑定在 Redis 与本地缓存的默认存活时间。
-	// 一局通常 ~5 分钟，3 小时给足冗余；不做命中续期，TTL 仅用于自动清理。
-	// 可用配置文件 placement.bind_ttl 覆盖(Go duration 格式，如 "3h"、"90m")。
-	defaultXuantanBindTTL = 3 * time.Hour
+	// 一局通常 ~5 分钟，15 分钟给足冗余；不做命中续期，TTL 仅用于自动清理。
+	// 可用配置文件 dapr.bind_ttl 覆盖(Go duration 格式，如 "15m"、"1h")。
+	defaultXuantanBindTTL = 15 * time.Minute
 
 	defaultXuantanKeyPrefix = "xt:dapr:bind:"
 	// defaultXuantanIdsPrefix room 有效 roomId 集合(SET)的 key 前缀，完整 key 为
@@ -98,6 +101,17 @@ const (
 	// 未设置=放置策略整体关闭。配置格式与业务侧 core/etc DaprConfig 完全一致(见
 	// inflight_xuantan.md)，两侧读同一份文件，保证「同一 Redis、同一 key」。所有参数均来自该文件。
 	envXuantanConfig = "KEY_XT_PLACEMENT_CONFIG"
+
+	// xuantanNotValid 是绑定脚本在「目标 id 无效」时返回的哨兵值，供 Go 侧识别并转成「无效」异常：
+	//   - room：roomId 不在有效集合(ids set)         (xuantanRoomBindScript)；
+	//   - table：tableId 未被业务预标记(绑定 key 不存在) (xuantanBindScript)。
+	// 含前导 \0，不可能与真实 host 地址(ip:port)冲突；须与两段 Lua 脚本里的字面量一致。
+	xuantanNotValid = "\x00xt-not-member"
+
+	// xuantanTableValidMark 是「有效牌桌」预标记值：业务在预建牌桌实例前把绑定 key 置为该值
+	// (见 core.IManager.MarkTableValid)，daprd 放置策略据此放行首次 host 分配(CAS 标记->host)；
+	// 绑定 key 不存在(未预标记)即视为无效 tableId，直接拒绝。须与业务侧 tableValidMark 一致。
+	xuantanTableValidMark = "1"
 )
 
 // defaultXuantanTableType / defaultXuantanRoomType 各策略默认绑定的 actorType 列表；
@@ -184,22 +198,24 @@ type xuantanCacheEntry struct {
 	at   time.Time
 }
 
-// xuantanBindScript 原子地"创建或按旧值 CAS 替换"绑定，并返回最终生效的 host 地址。
+// xuantanBindScript 原子地"按有效标记 CAS 分配"牌桌绑定，并返回最终生效的 host 地址。
 //
-//	KEYS[1] = 绑定 key
-//	ARGV[1] = expectedOld（调用方读到的旧值；新建时传 ""）
+//	KEYS[1] = 绑定 key（xt:dapr:bind:<type>:<tableId>）
+//	ARGV[1] = expectedOld（调用方读到的旧值；首次分配时传有效标记 "1"）
 //	ARGV[2] = newHost（哈希选出的新 host 地址）
 //	ARGV[3] = ttl 秒
 //
-// 语义：
-//   - key 不存在            -> 写入 newHost（等价 SET NX），返回 newHost；
-//   - 当前值 == expectedOld  -> 覆盖为 newHost（失效重分配的 CAS），返回 newHost；
-//   - 否则（已被他人改写）    -> 不动，返回当前值，让调用方采用既有权威绑定。
+// 语义（有效性门禁：牌桌必须先被业务预标记为有效才能分配 host）：
+//   - key 不存在            -> 未预标记(或标记已过期)，返回哨兵 xuantanNotValid，
+//     上层报「无效 tableId」，绝不写入绑定；
+//   - 当前值 == expectedOld  -> 命中读到的旧值（分配时即有效标记 "1"），覆盖为 newHost，返回 newHost；
+//   - 否则（已被他人改写为权威 host）    -> 不动，返回当前值，让调用方采用既有权威绑定。
+//
+// 注意：不再"key 不存在即 SET NX 建绑定"——那会给未经业务预建的任意 tableId 分配 host。
 var xuantanBindScript = redis.NewScript(`
 local cur = redis.call('GET', KEYS[1])
 if cur == false then
-    redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
-    return ARGV[2]
+    return '\0xt-not-member'
 end
 if cur == ARGV[1] then
     redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
@@ -217,6 +233,8 @@ return cur
 //	ARGV[2..] = 当前存活 host 地址列表(daprd 从 ring 读出)
 //
 // 语义：
+//   - 有效性门禁(先于一切)：field 不在 ids set(无效 roomId) -> 返回哨兵 xuantanNotValid，
+//     不建绑定；仅在此(重)分配路径校验，本地缓存命中路径不进本脚本、不校验；
 //   - 已有绑定且其 host 仍存活            -> 直接返回该 host(粘性，绝不迁移)；
 //   - 统计负载时顺带清理：bind 里的 roomId 若已不在 ids set(被业务删除) -> 立即 HDEL，
 //     既释放容量又自清理无效绑定；死 host 上的有效 room 不计入负载(待其被请求时重分配)；
@@ -225,6 +243,10 @@ return cur
 //   - 无存活 host                        -> 返回 ”，由上层报错重试。
 var xuantanRoomBindScript = redis.NewScript(`
 local field = ARGV[1]
+if redis.call('SISMEMBER', KEYS[2], field) == 0 then
+    return '\0xt-not-member'
+end
+
 local alive = {}
 for i = 2, #ARGV do alive[ARGV[i]] = 0 end
 
@@ -433,33 +455,47 @@ func (i *Inflight) resolveXuantanTable(req *api.LookupActorRequest) (*api.Lookup
 	defer cancel()
 	key := xuantanKeyPrefix + cacheKey
 
-	// ① 读现有绑定：存活则粘住(不续期)，并回填本地缓存。
+	// ① 读现有绑定并做有效性门禁：
+	//   - key 不存在        -> 未被业务预标记为有效(见 MarkTableValid) => 无效 tableId，直接异常；
+	//   - 值为存活 host      -> 已分配，粘住返回(不续期)，回填本地缓存；
+	//   - 值 == 有效标记 "1"  -> 已预标记待分配 => 走 ② 用 expectedOld="1" 做 CAS 分配；
+	//   - 其它(失效 host / 脏值) -> 无效(牌桌绝不迁移：host 失效即牌桌不可恢复) => 异常。
 	prev, err := xuantanRDB.Get(ctx, key).Result()
 	switch {
-	case err == nil && prev != "":
-		if h, alive := i.xuantanRingHost(ring, prev); alive {
-			xuantanCacheStore(cacheKey, prev, xtKindTable)
-			return i.xuantanResp(h), true, nil
-		}
-		// 绑定的 host 已失效 -> 走 ② 用 expectedOld=prev 做 CAS 重分配。
-	case err != nil && !errors.Is(err, redis.Nil):
+	case errors.Is(err, redis.Nil):
+		// 未预标记：任何未经业务预建的 tableId 都不分配 host。
+		msg := fmt.Sprintf("xuantan placement: %s table not pre-marked valid (key %q missing)", req.ActorKey(), key)
+		log.Warn(msg)
+		return nil, true, messages.ErrActorNoAddress.WithFormat(msg)
+	case err != nil:
 		// Redis 故障：不降级到原生哈希(会破坏粘性导致迁移)，返回可重试错误等待重试。
 		msg := fmt.Sprintf("xuantan placement: %s %q get failed: %v", req.ActorKey(), key, err)
 		log.Warn(msg)
 		return nil, true, messages.ErrActorNoAddress.WithFormat(msg)
-	default:
-		prev = "" // 无绑定（redis.Nil 或空值）
+	}
+	// err == nil：key 存在。
+	if h, alive := i.xuantanRingHost(ring, prev); alive {
+		// 已绑定到存活 host（值为 host 地址，非有效标记）-> 粘性返回。
+		xuantanCacheStore(cacheKey, prev, xtKindTable)
+		return i.xuantanResp(h), true, nil
+	}
+	if prev != xuantanTableValidMark {
+		// 既非存活 host、也非有效标记 "1"（失效 host / 脏值）-> 无效，异常。牌桌绝不迁移。
+		msg := fmt.Sprintf("xuantan placement: %s table invalid bind value %q (want %q or alive host)",
+			req.ActorKey(), prev, xuantanTableValidMark)
+		log.Warn(msg)
+		return nil, true, messages.ErrActorNoAddress.WithFormat(msg)
 	}
 
-	// ② 用 Dapr 原生哈希选新 host。
+	// ② 有效标记命中：用 Dapr 原生哈希选新 host。
 	host, err := ring.GetHost(req.ActorID)
 	if err != nil {
 		return nil, true, err
 	}
 
-	// ③ 原子创建或 CAS 替换，拿到最终权威绑定。
+	// ③ 以 expectedOld=有效标记 "1" 原子 CAS 分配，拿到最终权威绑定。
 	ttl := strconv.Itoa(int(xuantanBindTTL.Seconds()))
-	res, err := xuantanBindScript.Run(ctx, xuantanRDB, []string{key}, prev, host.Name, ttl).Result()
+	res, err := xuantanBindScript.Run(ctx, xuantanRDB, []string{key}, xuantanTableValidMark, host.Name, ttl).Result()
 	if err != nil {
 		// Redis 故障：不降级，返回可重试错误等待重试。
 		msg := fmt.Sprintf("xuantan placement: %s %q bind failed: %v", req.ActorKey(), key, err)
@@ -467,6 +503,12 @@ func (i *Inflight) resolveXuantanTable(req *api.LookupActorRequest) (*api.Lookup
 		return nil, true, messages.ErrActorNoAddress.WithFormat(msg)
 	}
 	finalName, _ := res.(string)
+	if finalName == xuantanNotValid {
+		// 竞态：有效标记在 GET 与 CAS 之间过期 -> 无效。
+		msg := fmt.Sprintf("xuantan placement: %s table mark expired before bind (key %q)", req.ActorKey(), key)
+		log.Warn(msg)
+		return nil, true, messages.ErrActorNoAddress.WithFormat(msg)
+	}
 
 	// ④ 采用权威绑定并回填本地缓存。
 	if finalName == host.Name {
@@ -482,9 +524,13 @@ func (i *Inflight) resolveXuantanTable(req *api.LookupActorRequest) (*api.Lookup
 	return nil, true, messages.ErrActorNoAddress.WithFormat(req.ActorKey())
 }
 
-// resolveXuantanRoom 房间(room)放置策略：最少负载 + 粘性不迁移、无 TTL。
+// resolveXuantanRoom 房间(room)放置策略：有效性门禁 + 最少负载 + 粘性不迁移、无 TTL。
 //
 // 与 table 的差异：
+//   - 有效性门禁：仅在(重)分配路径(本地缓存未命中，需访问 Redis 定址)才判定 roomId 是否在
+//     有效集合 xt:dapr:ids:<actorType>(业务经 AddIds/SetIds 维护)中——不在集合内即视为无效房间，
+//     直接返回异常(不分配 host、不激活)。该判定折入 xuantanRoomBindScript 原子完成，不加额外往返；
+//     本地缓存命中(已分配且 host 存活)时零 Redis、直接返回，不再校验。
 //   - 选址不用一致性哈希(roomId 是 <1000 的稀疏小集合，哈希会失衡)，改为在存活 host
 //     中选"当前承载最少者"；
 //   - 绑定无 TTL，常驻；清理靠 host 失效时的重分配，或外部 roomId owner 进程 HDEL；
@@ -499,7 +545,7 @@ func (i *Inflight) resolveXuantanRoom(req *api.LookupActorRequest) (*api.LookupA
 
 	cacheKey := req.ActorType + ":" + req.ActorID
 
-	// ⓪ 本地缓存命中且 host 仍存活 -> 直接返回(room 不按时间失效，仅 ring 判活)。
+	// ⓪ 本地缓存命中且 host 仍存活 -> 直接返回(room 不按时间失效，仅 ring 判活)；已分配即已通过门禁。
 	if v, ok := xuantanCache.Load(cacheKey); ok {
 		if e, _ := v.(xuantanCacheEntry); e.host != "" {
 			if h, alive := i.xuantanRingHost(ring, e.host); alive {
@@ -533,6 +579,12 @@ func (i *Inflight) resolveXuantanRoom(req *api.LookupActorRequest) (*api.LookupA
 		return nil, true, messages.ErrActorNoAddress.WithFormat(msg)
 	}
 	name, _ := res.(string)
+	if name == xuantanNotValid {
+		// 有效性门禁：roomId 不在有效集合内 -> 无效房间，直接返回异常(未建绑定、不激活)。
+		msg := fmt.Sprintf("xuantan placement: %s room not in valid id set %q", req.ActorKey(), idsKey)
+		log.Warn(msg)
+		return nil, true, messages.ErrActorNoAddress.WithFormat(msg)
+	}
 	if name == "" {
 		// 无存活 host 可选（并发下 ring 变空等边界）：报可重试错误，下次重选。
 		log.Warnf("xuantan placement: %s no alive host (alive=%d)", req.ActorKey(), len(hosts))

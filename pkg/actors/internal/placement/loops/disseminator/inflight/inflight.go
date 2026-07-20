@@ -81,6 +81,7 @@ type Inflight struct {
 
 func New(opts Options) *Inflight {
 	xuantanInit()
+	xuantanSetSelfHost(opts.Hostname, opts.Port) // 记录本 daprd 的 ring Host.Name，供优雅退出自标记排空
 	return &Inflight{
 		hostname:          opts.Hostname,
 		port:              opts.Port,

@@ -33,6 +33,7 @@ import (
 	"github.com/dapr/dapr/pkg/actors/hostconfig"
 	"github.com/dapr/dapr/pkg/actors/internal/apilevel"
 	"github.com/dapr/dapr/pkg/actors/internal/placement"
+	"github.com/dapr/dapr/pkg/actors/internal/placement/loops/disseminator/inflight"
 	"github.com/dapr/dapr/pkg/actors/internal/reentrancystore"
 	"github.com/dapr/dapr/pkg/actors/internal/scheduler"
 	internaltimers "github.com/dapr/dapr/pkg/actors/internal/timers"
@@ -101,6 +102,12 @@ type Interface interface {
 	RegisterHosted(context.Context, hostconfig.Config) error
 	UnRegisterHosted(ctx context.Context, actorTypes ...string) error
 	WaitForRegisteredHosts(ctx context.Context) error
+
+	// MarkSelfDraining 在本 daprd 进入优雅退出（block-shutdown 窗口起点）时调用：把本 host 标记为
+	// 「排空中」写入玄滩放置排空索引（xt:dapr:draining），令其它 daprd 的放置策略在新/重分配时把本 host
+	// 从候选剔除——只拦新分配，既有绑定/粘性不受影响；本 host 离开 ring 后标记靠 score 过期自清。
+	// 未启用玄滩放置策略时为 no-op。ttl 应覆盖 block-shutdown 窗口（建议 = blockShutdownDuration + 余量）。
+	MarkSelfDraining(ctx context.Context, ttl time.Duration) error
 }
 
 type actors struct {
@@ -539,6 +546,11 @@ func (a *actors) WaitForRegisteredHosts(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// MarkSelfDraining 见 Interface.MarkSelfDraining。actor 运行时未启用时也安全（inflight 侧自判空为 no-op）。
+func (a *actors) MarkSelfDraining(ctx context.Context, ttl time.Duration) error {
+	return inflight.MarkSelfDraining(ctx, ttl)
 }
 
 func (a *actors) RuntimeStatus() *runtimev1pb.ActorRuntime {

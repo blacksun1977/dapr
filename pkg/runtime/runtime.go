@@ -520,6 +520,15 @@ func (a *DaprRuntime) Run(parentCtx context.Context) error {
 			a.processor.Subscriber().StopAllSubscriptionsForever()
 			a.processor.Binding().StopReadingFromBindings(true)
 
+			// 玄滩自定义放置：进入 block-shutdown 即把本 host 自标记为「排空中」，令其它 daprd 的放置策略
+			// 停止向本 host 新/重分配 actor（既有绑定/粘性不受影响）；本 host 离开 ring 后标记靠 score 过期自清。
+			// ttl 覆盖整个 block 窗口 + 余量，避免窗口内标记过期导致本 host 又被选中。未启用玄滩放置时为 no-op。
+			markCtx, markCancel := context.WithTimeout(context.Background(), 3*time.Second)
+			if merr := a.actors.MarkSelfDraining(markCtx, *a.runtimeConfig.blockShutdownDuration+time.Minute); merr != nil {
+				log.Warnf("xuantan placement: mark self draining failed: %v", merr)
+			}
+			markCancel()
+
 			select {
 			case <-a.clock.After(*a.runtimeConfig.blockShutdownDuration):
 				log.Info("Block shutdown period expired, entering shutdown...")

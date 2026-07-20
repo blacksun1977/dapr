@@ -105,10 +105,20 @@ func xtSetup(c redis.UniversalClient) {
 	xuantanBindTTL = 3 * time.Hour
 	xuantanTypeKinds = []xuantanTypeKind{{typ: "table", kind: xtKindTable}, {typ: "room", kind: xtKindRoom}}
 	xtClearCache()
+	xuantanDrainCache.Store(nil) // 清进程内 draining 缓存，避免跨用例复用陈旧快照
 }
 
 func xtReq(actorType, id string) *api.LookupActorRequest {
 	return &api.LookupActorRequest{ActorType: actorType, ActorID: id}
+}
+
+// xtMarkDraining 把给定 host 写入排空索引 ZSET(score=now+10m，模拟其进入 block-shutdown)。
+func xtMarkDraining(t *testing.T, c redis.UniversalClient, hosts ...string) {
+	t.Helper()
+	exp := float64(time.Now().Add(10 * time.Minute).UnixMilli())
+	for _, h := range hosts {
+		require.NoError(t, c.ZAdd(context.Background(), xuantanDrainingKey, redis.Z{Score: exp, Member: h}).Err())
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -423,4 +433,149 @@ func TestXuantanRoomDeadHostReassign(t *testing.T) {
 	got, err := c.HGet(ctx, "xt:dapr:bind:room", "7").Result()
 	require.NoError(t, err)
 	assert.Equal(t, resp.Address, got)
+}
+
+// ---------------------------------------------------------------------------
+// 排空(draining)：新分配剔除正在排空的 host，粘性/既有绑定不受影响，空候选回退。
+// ---------------------------------------------------------------------------
+
+// table：首次分配时，若哈希首选 host 正在排空，则改选到非排空存活 host。
+func TestXuantanTableAvoidsDrainingHost(t *testing.T) {
+	ctx := context.Background()
+	c := xtRedis(t)
+	defer c.Close()
+	xtSetup(c)
+
+	h1, h2, h3 := "10.0.0.1:7", "10.0.0.2:7", "10.0.0.3:7"
+	in := xtInflight("table", xtRing(h1, h2, h3))
+	req := xtReq("table", "200001")
+
+	require.NoError(t, c.Set(ctx, "xt:dapr:bind:table:200001", xuantanTableValidMark, 0).Err())
+
+	// 把哈希首选 host 标记为排空，分配应避开它。
+	pref, err := in.hashTable.Entries["table"].GetHost("200001")
+	require.NoError(t, err)
+	xtMarkDraining(t, c, pref.Name)
+
+	resp, handled, err := in.resolveXuantanTable(req)
+	require.True(t, handled)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.NotEqual(t, pref.Name, resp.Address, "should avoid draining host")
+	assert.Contains(t, []string{h1, h2, h3}, resp.Address)
+}
+
+// table：全部 host 都在排空(=全体服务下线) -> 拒绝分配新桌，报可重试错误，且不写绑定。
+func TestXuantanTableAllDrainingRejected(t *testing.T) {
+	ctx := context.Background()
+	c := xtRedis(t)
+	defer c.Close()
+	xtSetup(c)
+
+	h1, h2 := "10.0.1.1:7", "10.0.1.2:7"
+	in := xtInflight("table", xtRing(h1, h2))
+	require.NoError(t, c.Set(ctx, "xt:dapr:bind:table:200002", xuantanTableValidMark, 0).Err())
+	xtMarkDraining(t, c, h1, h2)
+
+	resp, handled, err := in.resolveXuantanTable(xtReq("table", "200002"))
+	require.True(t, handled)
+	require.Error(t, err)
+	require.Nil(t, resp)
+
+	// 拒绝分配时不得把有效标记覆盖为 host（绑定仍为 "1"）。
+	got, err := c.Get(ctx, "xt:dapr:bind:table:200002").Result()
+	require.NoError(t, err)
+	assert.Equal(t, xuantanTableValidMark, got, "must not bind to a draining host")
+}
+
+// room：正在排空的 host 上的既有 room 保持粘性(不迁移)，新 room 一律落到非排空 host。
+func TestXuantanRoomAvoidsDrainingKeepsSticky(t *testing.T) {
+	ctx := context.Background()
+	c := xtRedis(t)
+	defer c.Close()
+	xtSetup(c)
+
+	h1, h2 := "rd1:9", "rd2:9"
+	in := xtInflight("room", xtRing(h1, h2))
+
+	// room 500 已绑定到 h1；把 h1 标记排空后仍应粘在 h1(不迁移)。
+	require.NoError(t, c.SAdd(ctx, "xt:dapr:ids:room", "500").Err())
+	require.NoError(t, c.HSet(ctx, "xt:dapr:bind:room", "500", h1).Err())
+	xtMarkDraining(t, c, h1)
+
+	resp, _, err := in.resolveXuantanRoom(xtReq("room", "500"))
+	require.NoError(t, err)
+	assert.Equal(t, h1, resp.Address, "existing room stays on draining host (sticky)")
+
+	// 新建 room 一律避开排空的 h1，落到 h2。
+	for i := 501; i <= 506; i++ {
+		id := strconv.Itoa(i)
+		require.NoError(t, c.SAdd(ctx, "xt:dapr:ids:room", id).Err())
+		r, _, err := in.resolveXuantanRoom(xtReq("room", id))
+		require.NoError(t, err)
+		assert.Equalf(t, h2, r.Address, "new room %s must avoid draining host", id)
+	}
+}
+
+// room：全部 host 都在排空(=全体服务下线) -> 拒绝分配新 room，报可重试错误，且不建绑定。
+func TestXuantanRoomAllDrainingRejected(t *testing.T) {
+	ctx := context.Background()
+	c := xtRedis(t)
+	defer c.Close()
+	xtSetup(c)
+
+	h1, h2 := "ra1:9", "ra2:9"
+	in := xtInflight("room", xtRing(h1, h2))
+	require.NoError(t, c.SAdd(ctx, "xt:dapr:ids:room", "900").Err())
+	xtMarkDraining(t, c, h1, h2)
+
+	resp, handled, err := in.resolveXuantanRoom(xtReq("room", "900"))
+	require.True(t, handled)
+	require.Error(t, err)
+	require.Nil(t, resp)
+
+	// 拒绝分配时不得建立绑定。
+	ex, err := c.HExists(ctx, "xt:dapr:bind:room", "900").Result()
+	require.NoError(t, err)
+	assert.False(t, ex, "must not bind a room to a draining host")
+}
+
+// MarkSelfDraining：写入自身 host.Name 到排空 ZSET，且能被 xuantanDrainingHosts 读回。
+func TestXuantanMarkSelfDraining(t *testing.T) {
+	ctx := context.Background()
+	c := xtRedis(t)
+	defer c.Close()
+	xtSetup(c)
+
+	oldSelf := xuantanSelfHost
+	t.Cleanup(func() { xuantanSelfHost = oldSelf })
+	xuantanSetSelfHost("10.9.9.9", "7000")
+
+	require.NoError(t, MarkSelfDraining(ctx, 5*time.Minute))
+	set := xuantanDrainingHosts(ctx)
+	_, ok := set["10.9.9.9:7000"]
+	assert.True(t, ok, "self host should be in draining set")
+}
+
+// 排空缓存(优化A)：首次读回填缓存；TTL 内即便 Redis 变了也返回旧快照（可容忍的 ≤TTL 陈旧）；
+// 缓存重置后再读拿到最新。
+func TestXuantanDrainCacheTTL(t *testing.T) {
+	ctx := context.Background()
+	c := xtRedis(t)
+	defer c.Close()
+	xtSetup(c)
+
+	// 空集合也缓存：首读回 Redis 得空，写入快照。
+	got := xuantanDrainingHostsCached(ctx)
+	assert.Empty(t, got)
+
+	// Redis 里新增一个 draining host，但 TTL 内缓存仍为旧（空）快照。
+	xtMarkDraining(t, c, "h:1")
+	assert.Empty(t, xuantanDrainingHostsCached(ctx), "within TTL should serve cached (stale) snapshot")
+
+	// 重置缓存后再读 -> 拿到最新。
+	xuantanDrainCache.Store(nil)
+	got = xuantanDrainingHostsCached(ctx)
+	_, ok := got["h:1"]
+	assert.True(t, ok, "after cache reset should reflect latest draining set")
 }

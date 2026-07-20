@@ -15,6 +15,7 @@ package fake
 
 import (
 	"context"
+	"time"
 
 	"github.com/dapr/dapr/pkg/actors"
 	"github.com/dapr/dapr/pkg/actors/hostconfig"
@@ -44,6 +45,7 @@ type Fake struct {
 	fnRegisterHosted         func(context.Context, hostconfig.Config) error
 	fnUnRegisterHosted       func(ctx context.Context, actorTypes ...string) error
 	fnWaitForRegisteredHosts func(ctx context.Context) error
+	fnMarkSelfDraining       func(ctx context.Context, ttl time.Duration) error
 }
 
 func New() *Fake {
@@ -82,6 +84,9 @@ func New() *Fake {
 			return nil
 		},
 		fnWaitForRegisteredHosts: func(context.Context) error {
+			return nil
+		},
+		fnMarkSelfDraining: func(context.Context, time.Duration) error {
 			return nil
 		},
 	}
@@ -189,6 +194,15 @@ func (f *Fake) RegisterHosted(ctx context.Context, cfg hostconfig.Config) error 
 
 func (f *Fake) WaitForRegisteredHosts(ctx context.Context) error {
 	return f.fnWaitForRegisteredHosts(ctx)
+}
+
+func (f *Fake) WithMarkSelfDraining(fn func(ctx context.Context, ttl time.Duration) error) *Fake {
+	f.fnMarkSelfDraining = fn
+	return f
+}
+
+func (f *Fake) MarkSelfDraining(ctx context.Context, ttl time.Duration) error {
+	return f.fnMarkSelfDraining(ctx, ttl)
 }
 
 func (f *Fake) UnRegisterHosted(ctx context.Context, ids ...string) error {

@@ -67,7 +67,7 @@ dapr:
     min_idle_conns: 0            # 每 endpoint 最少空闲连接
   key_prefix: "xt:dapr:bind:"    # 绑定 key 前缀（bind）
   ids_prefix: "xt:dapr:ids:"     # room 有效 id 集合（SET）前缀
-  bind_ttl: "3h"                 # table 绑定 TTL（Go duration，如 3h/90m）；room 无 TTL
+  bind_ttl: "15m"                # table 绑定 TTL（Go duration，如 15m/1h）；room 无 TTL
   sticky_type_table:             # 走 table 策略的 actorType 列表
     - "table_py"
     - "table"
@@ -81,7 +81,7 @@ dapr:
 | `redis`             | Redis 连接（格式同 `core/infra.RedisConfig`）；`addresses` 为空=整个策略关闭 | —          |
 | `key_prefix`        | 绑定 key 前缀（bind）                           | `xt:dapr:bind:`    |
 | `ids_prefix`        | room 有效 id 集合（SET）前缀                      | `xt:dapr:ids:`     |
-| `bind_ttl`          | table 绑定 TTL（Go duration，如 `3h`、`90m`）    | `3h`               |
+| `bind_ttl`          | table 绑定 TTL（Go duration，如 `15m`、`1h`）    | `15m`              |
 | `sticky_type_table` | 走 table 策略的 actorType 列表                  | `[table_py, table]` |
 | `sticky_type_room`  | 走 room 策略的 actorType 列表                   | `[room_py, room]`   |
 
@@ -102,7 +102,7 @@ dapr:
 ```
 key   = <KEY_PREFIX><actorType>:<actorID>     例: xt:dapr:bind:table:123456
 value = <hostAddr>
-TTL   = dapr.bind_ttl（默认 3h）
+TTL   = dapr.bind_ttl（默认 15m）
 ```
 
 ### 4.2 room（每个 actorType 一张 hash + 一个外部维护的 SET）
@@ -132,39 +132,42 @@ TTL   = dapr.bind_ttl（默认 3h）
 > 与旧版差异：旧版“key 不存在即 SET NX 建绑定”会给任意 tableId 凭空激活牌桌；现要求业务先 `MarkTableValid`。
 > 有效性门禁只在（分配/未命中）路径判定；本地缓存命中(已分配且 host 存活)时零 Redis、直接返回。
 
-流程：
+流程（**(重)分配只 1 次 Redis 往返**：单脚本一趟完成门禁+粘性+CAS，存活判定在 daprd 侧做，脚本无需知道 ring）：
 
 ```
 ⓪ 本地缓存命中且 host 在 ring 内(存活) 且未过期(≤TTL)  → 直接返回（热路径零 Redis）
-① GET 绑定
-   - key 不存在(redis.Nil) → 未预标记 => 无效 tableId，handled=true + ErrActorNoAddress
-   - Redis 故障           → 记日志，handled=true + ErrActorNoAddress(可重试，不降级)
-   - 值为存活 host        → 回填缓存，返回（粘住，不续期 TTL）
-   - 值 != "1"(失效 host/脏值) → 无效，handled=true + ErrActorNoAddress（不迁移、不重分配）
-   - 值 == "1"(有效标记)  → 转 ② 分配
-② ring.GetHost(actorID) 用一致性哈希选新 host
-③ Lua CAS 原子写入（xuantanBindScript，expectedOld="1"）：
-   - key 不存在        → 返回哨兵（标记已过期）→ 上层报无效
-   - 当前值=="1"       → 覆盖为 newHost（分配）
-   - 否则(被他人抢写)  → 返回既有权威值
-④ 采用权威绑定，回填本地缓存并返回
+① 本地算候选 cand：ring.GetHost(actorID) 一致性哈希首选
+   - 若首选 host 正在排空(命中 xt:dapr:draining 进程缓存) → 在非排空存活 host 中按 actorID 确定性改选；
+     全在排空(=全体服务下线) → 不分配，handled=true + ErrActorNoAddress(可重试，绝不硬塞排空 host)。
+   - 排空集合走进程内缓存(默认 1s)，建桌高峰下不增加 Redis 往返；仅新分配过滤，粘性走脚本内判定不受影响。
+② 单脚本一趟（xuantanBindScript，ARGV: "1", cand, ttl）：GET 现值 → 门禁+粘性+CAS 原子完成
+③ 据脚本返回值解释（daprd 本地判活）：
+   - 返回哨兵           → key 不存在=未预标记 => 无效 tableId，handled=true + ErrActorNoAddress
+   - Redis 故障(脚本报错) → 记日志，handled=true + ErrActorNoAddress(可重试，不降级)
+   - 返回 == cand        → 我方 CAS 分配成功 / 既有绑定恰为 cand（取自存活 ring，必存活）→ 回填缓存、采用
+   - 返回其它 host       → 本地判活：存活=粘性返回(不续期)；失效/脏值=无效(牌桌绝不迁移) + ErrActorNoAddress
 ```
 
-`xuantanBindScript`（有效标记 CAS 分配）：
+`xuantanBindScript`（门禁 + 粘性 + 有效标记 CAS，一趟）：
 
 ```lua
--- KEYS[1]=bindKey  ARGV[1]=expectedOld(分配传有效标记"1")  ARGV[2]=newHost  ARGV[3]=ttl秒
+-- KEYS[1]=bindKey  ARGV[1]=有效标记"1"  ARGV[2]=cand(候选host)  ARGV[3]=ttl秒
 local cur = redis.call('GET', KEYS[1])
 if cur == false then return '\0xt-not-member' end            -- 未预标记 => 无效(不建绑定)
-if cur == ARGV[1] then redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3]); return ARGV[2] end
-return cur
+if cur == ARGV[1] then redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3]); return ARGV[2] end  -- CAS 分配
+return cur                                                    -- 已是某 host/脏值 => 原样返回，由 daprd 判活
 ```
+
+> **1 RTT 设计**：早先「先 GET 判粘性/门禁，再 CAS」是 2 次往返；现改为「本地算好 cand → 只调一次脚本 →
+> daprd 对返回值本地判活」。存活判定天然是 daprd 侧知识（ring 成员），放回 Go 侧后脚本连 alive 列表都不用传，
+> 且绑定 key 与排空 key 不同 slot 的 Cluster 问题也自然规避（排空过滤在 daprd 侧用缓存做，不进脚本）。
+> 叠加排空进程缓存，(重)分配从 3 次 RTT（GET+ZRANGEBYSCORE+CAS）降到 **1 次**。
 
 **谁写有效标记**：游戏业务分配 tid（`Mesh().Sequence().NextId("table")`）后、`create.table.ins` 预建牌桌实例
 之前，调 `MarkTableValid(ActorTypeBattlePy, tid)` 写入 `"1"`（见 `game/worker/pypy/create_table.go`）。
 
 **TTL 策略**：绑定与本地缓存条目均为 `BIND_TTL`，且**不做命中续期**——TTL 仅用于无人值守的自动清理。约束：`actor 存活时长 < TTL`
-。牌桌一局 ~5 分钟，远小于 3h，绝不会在对局期间过期。有效标记 `"1"` 也用同一 TTL 写入，覆盖“预标记→首次分配”窗口。
+。牌桌一局 ~5 分钟，小于 15m，正常对局不会过期；业务侧对活跃牌桌可续期（`MarkTableValid` 幂等 EXPIRE）。有效标记 `"1"` 也用同一 TTL 写入，覆盖“预标记→首次分配”窗口。
 
 ## 6. room 策略（`resolveXuantanRoom`）
 
@@ -176,32 +179,38 @@ return cur
 ⓪ 本地缓存命中且 host 存活        → 直接返回（已分配即已通过门禁；零 Redis，不再校验）
    枚举 ring 内所有存活 host 作为候选集（xuantanRingHosts）
    候选为空 → ErrActorNoAddress（可重试）
-   调用 Lua（xuantanRoomBindScript），传入 roomId、存活 host 列表：
+   读排空集合(xt:dapr:draining，进程缓存) → 正在排空的 host 列表(dlist)
+   调用 Lua（xuantanRoomBindScript），传入 roomId、dlist、全部存活 host 列表：
      - 有效性门禁（仅在此分配/未命中路径）：roomId 不在 ids SET → 返回哨兵
        → 上层报 ErrActorNoAddress（无效房间，不建绑定、不激活）
-     - 现绑定 host 存活            → 直接返回（粘性）
+     - 现绑定 host 存活（含正在排空者）→ 直接返回（粘性，排空 host 上的既有 room 不迁移）
      - 顺带清理：bind 中的 roomId 不在 ids SET → 立即 HDEL（自清理）
-     - 在存活 host 中选承载最少者(平手按地址名定序) → HSET 写入
-     - 无存活 host → 返回 ''（上层报 ErrActorNoAddress 可重试）
+     - 在【非排空】存活 host 中选承载最少者(平手按地址名定序) → HSET 写入
+     - 无「非排空」存活 host（全在排空=全体服务下线）或无存活 host → 返回 ''（上层报 ErrActorNoAddress 可重试，绝不硬塞排空 host）
    回填本地缓存并返回
    Redis 故障 → handled=true + ErrActorNoAddress(可重试，不降级)
 ```
 
-`xuantanRoomBindScript`（最少负载 + 粘性 + 清理）：
+`xuantanRoomBindScript`（最少负载 + 粘性 + 清理 + 排空过滤）：
 
 ```lua
 -- KEYS[1]=bind hash(xt:dapr:bind:<type>)  KEYS[2]=ids set(xt:dapr:ids:<type>)
--- ARGV[1]=roomId  ARGV[2..]=存活 host 列表
+-- ARGV[1]=roomId  ARGV[2]=D(排空 host 数)  ARGV[3..2+D]=排空 host  ARGV[3+D..]=全部存活 host
 local field = ARGV[1]
 if redis.call('SISMEMBER', KEYS[2], field) == 0 then
     return '\0xt-not-member'                              -- 门禁：无效 roomId，不分配（哨兵）
 end
 
+local dcount = tonumber(ARGV[2])
+local draining = {}
+for i = 3, 2 + dcount do draining[ARGV[i]] = true end     -- 正在排空的 host（选址剔除）
+
+local firstAlive = 3 + dcount
 local alive = {}
-for i = 2, #ARGV do alive[ARGV[i]] = 0 end
+for i = firstAlive, #ARGV do alive[ARGV[i]] = 0 end       -- 全部存活（含排空，用于粘性判活）
 
 local cur = redis.call('HGET', KEYS[1], field)
-if cur and alive[cur] ~= nil then return cur end          -- 粘性：存活就不动
+if cur and alive[cur] ~= nil then return cur end          -- 粘性：存活就不动（含排空 host）
 
 local all = redis.call('HGETALL', KEYS[1])
 for i = 1, #all, 2 do
@@ -214,15 +223,15 @@ for i = 1, #all, 2 do
     end
 end
 
-local best, bestCount
-for i = 2, #ARGV do
+local best, bestCount      -- 仅在「非排空」存活 host 里选承载最少者
+for i = firstAlive, #ARGV do
     local h = ARGV[i]
-    local c = alive[h]
-    if best == nil or c < bestCount or (c == bestCount and h < best) then
-        best = h; bestCount = c
+    if not draining[h] then
+        local c = alive[h]
+        if best == nil or c < bestCount or (c == bestCount and h < best) then best = h; bestCount = c end
     end
 end
-if best == nil then return '' end                         -- 无存活 host
+if best == nil then return '' end                         -- 无「非排空」存活 host（全在排空=全体下线）→ 上层报错
 redis.call('HSET', KEYS[1], field, best)
 return best
 ```
@@ -264,6 +273,7 @@ bind 字段 `HDEL`，减轻对应 host 负载并自清理。
 | actorType 非受管            | 旁路，回退原生哈希                          |
 | Redis 操作失败（table/room）   | 记日志，`handled=true` + `ErrActorNoAddress`（可重试），**不降级**（降级会破坏 table 粘性、room 均衡） |
 | ring 无该 actorType / 候选为空 | `ErrActorNoAddress`（可重试）           |
+| 全部存活 host 都在排空（全体下线）  | 拒绝新分配（table/room），`ErrActorNoAddress`（可重试），**绝不硬塞排空 host** |
 | 选中 host 并发下发中失效          | `ErrActorNoAddress`（可重试），下次重选      |
 
 > 单次 Redis 操作超时 `xuantanRedisOpTimeout = 2s`，避免抖动阻塞热路径。
@@ -297,8 +307,38 @@ daprd 分配时把 `"1"` CAS 覆盖为实际 host；未预标记（key 不存在
 |--------------|-------------------------------------------|
 | Redis 操作超时   | `2s`                                      |
 | 本地缓存 GC 周期   | `1min`                                    |
-| table 绑定 TTL | `dapr.bind_ttl`，默认 `3h`，不续期   |
+| table 绑定 TTL | `dapr.bind_ttl`，默认 `15m`，不自动命中续期 |
 | room 绑定 TTL  | 无（常驻，靠重分配/ids 清理）                         |
 | table 有效性门禁 | 业务 `MarkTableValid` 预标记 `"1"`（未标记即拒绝）      |
 | table 单激活    | Lua CAS（仅当值为 `"1"` 才覆盖为 host）              |
 | room 单激活     | 单条 Lua（HGET 粘性 + 最少负载 HSET）               |
+| 排空索引 key    | `xt:dapr:draining`（ZSET，member=host.Name，score=过期时刻ms） |
+| 排空自标记 TTL   | `blockShutdownDuration + 1m`（覆盖 block 窗口）      |
+| 排空集合进程缓存   | `1s`（分配路径读缓存，避免高峰下每次分配 ZRANGEBYSCORE）      |
+| table (重)分配 RTT | **1 次**（单脚本；排空过滤在 daprd 侧用缓存）       |
+
+## 12. 优雅退出与排空（draining，滚动更新）
+
+滚动更新/缩容时，某 daprd 会收到 SIGTERM 进入优雅退出。若配置了 `dapr.io/block-shutdown-duration`，daprd 在真正
+离开 placement ring 之前会**阻塞一段时间**继续服务在途请求（让长生命周期 actor 收尾）。这段窗口内该 host **仍在 ring**，
+原生策略仍会把「新 actor」分配上来——但它马上就要退出，属于无效分配。排空机制解决这个问题：
+
+**自标记（daprd 侧）**：daprd 一进入 block-shutdown 窗口，就把**自身 ring 地址** `host.Name`（`hostname:port`）写入排空索引
+`xt:dapr:draining`（ZSET，score = now + ttl）。ttl 取 `blockShutdownDuration + 余量`，确保覆盖整个 block 窗口；host 离开
+ring 后该条目靠 score 过期自清，读取方也顺带 `ZREMRANGEBYSCORE` 懒清历史成员。
+
+- 接入点：`runtime.go` block-shutdown 分支 → `actors.Interface.MarkSelfDraining(ttl)` → `inflight.MarkSelfDraining`。
+- 自身地址来源：`inflight.New(Options{Hostname,Port})` 时经 `xuantanSetSelfHost` 记为进程内单值 `xuantanSelfHost`。
+- 未启用玄滩放置（无 `KEY_XT_PLACEMENT_CONFIG` / redis 关闭）时整体 no-op。
+
+**候选过滤（策略侧）**：其它 daprd 在**（重）分配路径**读排空集合，把正在排空的 host 从候选剔除：
+
+- **table**：首选哈希 host 若在排空集合 → 在非排空存活 host 中按 actorID 确定性改选；
+- **room**：把排空 host 传入 Lua，选址时跳过；但排空 host **仍算存活**参与粘性判定，故其上的既有 room **不迁移**；
+- **全在排空 = 全体服务下线**：table/room 均**拒绝新分配**、返回可重试错误，绝不硬塞到正在排空的 host（等新实例就绪后由上层重试）；
+- **只拦新分配**：粘性/既有绑定完全不受影响——排空 host 在离开 ring 前继续承载已激活的 actor。
+
+**与业务侧 drain-aware Close 配合**：业务 Go 进程同样收到 SIGTERM，其 `run.go` 信号处理会等待本机在途 actor 排空
+（`manager.LiveCount()` 归零或超时）再 Close。两侧配合：daprd 用 block-shutdown 保住在途调用不被打断 + 自标记停止进新
+actor；业务进程等既有 actor 自然收尾。要求 K8s `terminationGracePeriodSeconds` ≥ `block-shutdown-duration` ≥ 业务
+drain 超时，留足收尾时间。

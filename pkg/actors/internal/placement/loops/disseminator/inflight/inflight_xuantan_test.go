@@ -103,7 +103,7 @@ func xtSetup(c redis.UniversalClient) {
 	xuantanKeyPrefix = "xt:dapr:bind:"
 	xuantanIdsPrefix = "xt:dapr:ids:"
 	xuantanBindTTL = 3 * time.Hour
-	xuantanTypeKinds = []xuantanTypeKind{{typ: "table", kind: xtKindTable}, {typ: "room", kind: xtKindRoom}}
+	xuantanTypeKinds = []xuantanTypeKind{{typ: "table", kind: xtKindBattle}, {typ: "room", kind: xtKindMatch}}
 	xtClearCache()
 	xuantanDrainCache.Store(nil) // 清进程内 draining 缓存，避免跨用例复用陈旧快照
 }
@@ -130,32 +130,32 @@ func TestXuantanKindOf(t *testing.T) {
 	t.Cleanup(func() { xuantanTypeKinds = old })
 
 	xuantanTypeKinds = []xuantanTypeKind{
-		{typ: "table", kind: xtKindTable},
-		{typ: "table_py", kind: xtKindTable},
-		{typ: "room", kind: xtKindRoom},
+		{typ: "table", kind: xtKindBattle},
+		{typ: "table_py", kind: xtKindBattle},
+		{typ: "room", kind: xtKindMatch},
 	}
-	assert.Equal(t, xtKindTable, xuantanKindOf("table"))
-	assert.Equal(t, xtKindTable, xuantanKindOf("table_py"))
-	assert.Equal(t, xtKindRoom, xuantanKindOf("room"))
+	assert.Equal(t, xtKindBattle, xuantanKindOf("table"))
+	assert.Equal(t, xtKindBattle, xuantanKindOf("table_py"))
+	assert.Equal(t, xtKindMatch, xuantanKindOf("room"))
 	assert.Equal(t, 0, xuantanKindOf("user"))
 	assert.Equal(t, 0, xuantanKindOf(""))
 }
 
 func TestXuantanAppendTypes(t *testing.T) {
-	got := xuantanAppendTypes(nil, []string{" a ", " b ", "", " c "}, []string{"def"}, xtKindTable)
+	got := xuantanAppendTypes(nil, []string{" a ", " b ", "", " c "}, []string{"def"}, xtKindBattle)
 	require.Len(t, got, 3)
-	assert.Equal(t, xuantanTypeKind{typ: "a", kind: xtKindTable}, got[0])
-	assert.Equal(t, xuantanTypeKind{typ: "b", kind: xtKindTable}, got[1])
-	assert.Equal(t, xuantanTypeKind{typ: "c", kind: xtKindTable}, got[2])
+	assert.Equal(t, xuantanTypeKind{typ: "a", kind: xtKindBattle}, got[0])
+	assert.Equal(t, xuantanTypeKind{typ: "b", kind: xtKindBattle}, got[1])
+	assert.Equal(t, xuantanTypeKind{typ: "c", kind: xtKindBattle}, got[2])
 
 	// 配置为空时回退默认列表
-	got2 := xuantanAppendTypes(nil, nil, []string{"x", "y"}, xtKindRoom)
+	got2 := xuantanAppendTypes(nil, nil, []string{"x", "y"}, xtKindMatch)
 	require.Len(t, got2, 2)
-	assert.Equal(t, xuantanTypeKind{typ: "x", kind: xtKindRoom}, got2[0])
-	assert.Equal(t, xuantanTypeKind{typ: "y", kind: xtKindRoom}, got2[1])
+	assert.Equal(t, xuantanTypeKind{typ: "x", kind: xtKindMatch}, got2[0])
+	assert.Equal(t, xuantanTypeKind{typ: "y", kind: xtKindMatch}, got2[1])
 
 	// 追加语义：在已有切片后继续追加
-	merged := xuantanAppendTypes(got2, []string{" a ", " b ", "", " c "}, []string{"def"}, xtKindTable)
+	merged := xuantanAppendTypes(got2, []string{" a ", " b ", "", " c "}, []string{"def"}, xtKindBattle)
 	require.Len(t, merged, 5)
 }
 
@@ -163,14 +163,14 @@ func TestXuantanCacheStoreKind(t *testing.T) {
 	xtClearCache()
 	t.Cleanup(xtClearCache)
 
-	xuantanCacheStore("room:1", "h:1", xtKindRoom)
-	xuantanCacheStore("table:1", "h:2", xtKindTable)
+	xuantanCacheStore("room:1", "h:1", xtKindMatch)
+	xuantanCacheStore("table:1", "h:2", xtKindBattle)
 
 	v, ok := xuantanCache.Load("room:1")
 	require.True(t, ok)
 	e := v.(xuantanCacheEntry)
 	assert.Equal(t, "h:1", e.host)
-	assert.Equal(t, xtKindRoom, e.kind)
+	assert.Equal(t, xtKindMatch, e.kind)
 	assert.WithinDuration(t, time.Now(), e.at, time.Second)
 }
 
@@ -192,7 +192,7 @@ func TestXuantanResolveBypassWhenDisabled(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // table：预标记有效 -> 首次哈希分配 -> 持久化 -> 粘性 -> host 失效后拒绝(不迁移)。
-func TestXuantanTableAssignStickyReject(t *testing.T) {
+func TestXuantanBattleAssignStickyReject(t *testing.T) {
 	ctx := context.Background()
 	c := xtRedis(t)
 	defer c.Close()
@@ -202,11 +202,11 @@ func TestXuantanTableAssignStickyReject(t *testing.T) {
 	in := xtInflight("table", xtRing(h1, h2, h3))
 	req := xtReq("table", "100001")
 
-	// 业务预标记：绑定 key 置为有效标记 "1"(模拟 MarkTableValid)。
-	require.NoError(t, c.Set(ctx, "xt:dapr:bind:table:100001", xuantanTableValidMark, 0).Err())
+	// 业务预标记：绑定 key 置为有效标记 "1"(模拟 MarkBattleValid)。
+	require.NoError(t, c.Set(ctx, "xt:dapr:bind:table:100001", xuantanBattleValidMark, 0).Err())
 
 	// 首次分配：门禁通过(值为 "1") -> CAS 分配 host。
-	resp, handled, err := in.resolveXuantanTable(req)
+	resp, handled, err := in.resolveXuantanBattle(req)
 	require.True(t, handled)
 	require.NoError(t, err)
 	require.NotNil(t, resp)
@@ -220,7 +220,7 @@ func TestXuantanTableAssignStickyReject(t *testing.T) {
 
 	// 粘性：清本地缓存强制走 Redis，仍返回同一 host
 	xtClearCache()
-	resp2, _, err := in.resolveXuantanTable(req)
+	resp2, _, err := in.resolveXuantanBattle(req)
 	require.NoError(t, err)
 	assert.Equal(t, first, resp2.Address)
 
@@ -228,7 +228,7 @@ func TestXuantanTableAssignStickyReject(t *testing.T) {
 	live := xtExclude(first, h1, h2, h3)
 	in = xtInflight("table", xtRing(live...))
 	xtClearCache()
-	resp3, handled3, err3 := in.resolveXuantanTable(req)
+	resp3, handled3, err3 := in.resolveXuantanBattle(req)
 	assert.True(t, handled3)
 	assert.Error(t, err3)
 	assert.Nil(t, resp3)
@@ -240,7 +240,7 @@ func TestXuantanTableAssignStickyReject(t *testing.T) {
 }
 
 // table：未预标记(绑定 key 不存在)的 tableId -> 有效性门禁直接拒绝，且不建立任何绑定。
-func TestXuantanTableNotMarkedRejected(t *testing.T) {
+func TestXuantanBattleNotMarkedRejected(t *testing.T) {
 	ctx := context.Background()
 	c := xtRedis(t)
 	defer c.Close()
@@ -249,7 +249,7 @@ func TestXuantanTableNotMarkedRejected(t *testing.T) {
 	in := xtInflight("table", xtRing("a:1", "b:1"))
 
 	// 不预标记 tableId "555"：应被门禁直接拒绝。
-	resp, handled, err := in.resolveXuantanTable(xtReq("table", "555"))
+	resp, handled, err := in.resolveXuantanBattle(xtReq("table", "555"))
 	require.True(t, handled)
 	require.Error(t, err)
 	require.Nil(t, resp)
@@ -261,14 +261,14 @@ func TestXuantanTableNotMarkedRejected(t *testing.T) {
 }
 
 // table：并发首次分配收敛到同一 host，Redis 仅一个权威值。
-func TestXuantanTableConcurrentConverge(t *testing.T) {
+func TestXuantanBattleConcurrentConverge(t *testing.T) {
 	ctx := context.Background()
 	c := xtRedis(t)
 	defer c.Close()
 	xtSetup(c)
 
 	// 业务预标记 tableId "casid" 为有效，才允许并发分配。
-	require.NoError(t, c.Set(ctx, "xt:dapr:bind:table:casid", xuantanTableValidMark, 0).Err())
+	require.NoError(t, c.Set(ctx, "xt:dapr:bind:table:casid", xuantanBattleValidMark, 0).Err())
 
 	hosts := []string{"a:1", "b:1", "c:1", "d:1"}
 	const n = 32
@@ -279,7 +279,7 @@ func TestXuantanTableConcurrentConverge(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			in := xtInflight("table", xtRing(hosts...))
-			r, _, err := in.resolveXuantanTable(xtReq("table", "casid"))
+			r, _, err := in.resolveXuantanBattle(xtReq("table", "casid"))
 			if err == nil && r != nil {
 				results[idx] = r.Address
 			}
@@ -297,7 +297,7 @@ func TestXuantanTableConcurrentConverge(t *testing.T) {
 }
 
 // room：N 个 room 在 M 个 host 上均衡分布(最大-最小 <= 1)。
-func TestXuantanRoomBalanced(t *testing.T) {
+func TestXuantanMatchBalanced(t *testing.T) {
 	ctx := context.Background()
 	c := xtRedis(t)
 	defer c.Close()
@@ -313,7 +313,7 @@ func TestXuantanRoomBalanced(t *testing.T) {
 
 	counts := map[string]int{}
 	for i := 0; i < n; i++ {
-		resp, handled, err := in.resolveXuantanRoom(xtReq("room", strconv.Itoa(1000+i)))
+		resp, handled, err := in.resolveXuantanMatch(xtReq("room", strconv.Itoa(1000+i)))
 		require.True(t, handled)
 		require.NoError(t, err)
 		require.NotNil(t, resp)
@@ -335,7 +335,7 @@ func TestXuantanRoomBalanced(t *testing.T) {
 }
 
 // room：统计时清理不在 ids set 的无效绑定。
-func TestXuantanRoomInvalidCleanup(t *testing.T) {
+func TestXuantanMatchInvalidCleanup(t *testing.T) {
 	ctx := context.Background()
 	c := xtRedis(t)
 	defer c.Close()
@@ -349,7 +349,7 @@ func TestXuantanRoomInvalidCleanup(t *testing.T) {
 	// 一个有效 room
 	require.NoError(t, c.SAdd(ctx, "xt:dapr:ids:room", "1").Err())
 
-	resp, handled, err := in.resolveXuantanRoom(xtReq("room", "1"))
+	resp, handled, err := in.resolveXuantanMatch(xtReq("room", "1"))
 	require.True(t, handled)
 	require.NoError(t, err)
 	require.NotNil(t, resp)
@@ -361,7 +361,7 @@ func TestXuantanRoomInvalidCleanup(t *testing.T) {
 }
 
 // room：roomId 不在有效集合内 -> 有效性门禁直接拒绝(handled=true + 错误)，且不建立任何绑定。
-func TestXuantanRoomNotInIdsRejected(t *testing.T) {
+func TestXuantanMatchNotInIdsRejected(t *testing.T) {
 	ctx := context.Background()
 	c := xtRedis(t)
 	defer c.Close()
@@ -371,7 +371,7 @@ func TestXuantanRoomNotInIdsRejected(t *testing.T) {
 	in := xtInflight("room", xtRing(hosts...))
 
 	// 不把 roomId "42" 加入 xt:dapr:ids:room：应被门禁直接拒绝。
-	resp, handled, err := in.resolveXuantanRoom(xtReq("room", "42"))
+	resp, handled, err := in.resolveXuantanMatch(xtReq("room", "42"))
 	require.True(t, handled)
 	require.Error(t, err)
 	require.Nil(t, resp)
@@ -397,21 +397,21 @@ func TestXuantanRedisFailureNoFallback(t *testing.T) {
 
 	// table：GET 失败 -> handled=true + 错误，且不返回地址(未降级)。
 	inT := xtInflight("table", xtRing("a:1", "b:1"))
-	resp, handled, err := inT.resolveXuantanTable(xtReq("table", "x"))
+	resp, handled, err := inT.resolveXuantanBattle(xtReq("table", "x"))
 	assert.True(t, handled, "must take over, not fall back to hashing")
 	assert.Nil(t, resp)
 	assert.Error(t, err)
 
 	// room：脚本执行失败 -> handled=true + 错误。
 	inR := xtInflight("room", xtRing("r1:1", "r2:1"))
-	resp2, handled2, err2 := inR.resolveXuantanRoom(xtReq("room", "y"))
+	resp2, handled2, err2 := inR.resolveXuantanMatch(xtReq("room", "y"))
 	assert.True(t, handled2, "must take over, not fall back to hashing")
 	assert.Nil(t, resp2)
 	assert.Error(t, err2)
 }
 
 // room：绑定的 host 失效后，重分配到存活 host。
-func TestXuantanRoomDeadHostReassign(t *testing.T) {
+func TestXuantanMatchDeadHostReassign(t *testing.T) {
 	ctx := context.Background()
 	c := xtRedis(t)
 	defer c.Close()
@@ -424,7 +424,7 @@ func TestXuantanRoomDeadHostReassign(t *testing.T) {
 	live := []string{"live1:9", "live2:9"}
 	in := xtInflight("room", xtRing(live...))
 
-	resp, handled, err := in.resolveXuantanRoom(xtReq("room", "7"))
+	resp, handled, err := in.resolveXuantanMatch(xtReq("room", "7"))
 	require.True(t, handled)
 	require.NoError(t, err)
 	require.NotNil(t, resp)
@@ -440,7 +440,7 @@ func TestXuantanRoomDeadHostReassign(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // table：首次分配时，若哈希首选 host 正在排空，则改选到非排空存活 host。
-func TestXuantanTableAvoidsDrainingHost(t *testing.T) {
+func TestXuantanBattleAvoidsDrainingHost(t *testing.T) {
 	ctx := context.Background()
 	c := xtRedis(t)
 	defer c.Close()
@@ -450,14 +450,14 @@ func TestXuantanTableAvoidsDrainingHost(t *testing.T) {
 	in := xtInflight("table", xtRing(h1, h2, h3))
 	req := xtReq("table", "200001")
 
-	require.NoError(t, c.Set(ctx, "xt:dapr:bind:table:200001", xuantanTableValidMark, 0).Err())
+	require.NoError(t, c.Set(ctx, "xt:dapr:bind:table:200001", xuantanBattleValidMark, 0).Err())
 
 	// 把哈希首选 host 标记为排空，分配应避开它。
 	pref, err := in.hashTable.Entries["table"].GetHost("200001")
 	require.NoError(t, err)
 	xtMarkDraining(t, c, pref.Name)
 
-	resp, handled, err := in.resolveXuantanTable(req)
+	resp, handled, err := in.resolveXuantanBattle(req)
 	require.True(t, handled)
 	require.NoError(t, err)
 	require.NotNil(t, resp)
@@ -466,7 +466,7 @@ func TestXuantanTableAvoidsDrainingHost(t *testing.T) {
 }
 
 // table：全部 host 都在排空(=全体服务下线) -> 拒绝分配新桌，报可重试错误，且不写绑定。
-func TestXuantanTableAllDrainingRejected(t *testing.T) {
+func TestXuantanBattleAllDrainingRejected(t *testing.T) {
 	ctx := context.Background()
 	c := xtRedis(t)
 	defer c.Close()
@@ -474,10 +474,10 @@ func TestXuantanTableAllDrainingRejected(t *testing.T) {
 
 	h1, h2 := "10.0.1.1:7", "10.0.1.2:7"
 	in := xtInflight("table", xtRing(h1, h2))
-	require.NoError(t, c.Set(ctx, "xt:dapr:bind:table:200002", xuantanTableValidMark, 0).Err())
+	require.NoError(t, c.Set(ctx, "xt:dapr:bind:table:200002", xuantanBattleValidMark, 0).Err())
 	xtMarkDraining(t, c, h1, h2)
 
-	resp, handled, err := in.resolveXuantanTable(xtReq("table", "200002"))
+	resp, handled, err := in.resolveXuantanBattle(xtReq("table", "200002"))
 	require.True(t, handled)
 	require.Error(t, err)
 	require.Nil(t, resp)
@@ -485,11 +485,11 @@ func TestXuantanTableAllDrainingRejected(t *testing.T) {
 	// 拒绝分配时不得把有效标记覆盖为 host（绑定仍为 "1"）。
 	got, err := c.Get(ctx, "xt:dapr:bind:table:200002").Result()
 	require.NoError(t, err)
-	assert.Equal(t, xuantanTableValidMark, got, "must not bind to a draining host")
+	assert.Equal(t, xuantanBattleValidMark, got, "must not bind to a draining host")
 }
 
 // room：正在排空的 host 上的既有 room 保持粘性(不迁移)，新 room 一律落到非排空 host。
-func TestXuantanRoomAvoidsDrainingKeepsSticky(t *testing.T) {
+func TestXuantanMatchAvoidsDrainingKeepsSticky(t *testing.T) {
 	ctx := context.Background()
 	c := xtRedis(t)
 	defer c.Close()
@@ -503,7 +503,7 @@ func TestXuantanRoomAvoidsDrainingKeepsSticky(t *testing.T) {
 	require.NoError(t, c.HSet(ctx, "xt:dapr:bind:room", "500", h1).Err())
 	xtMarkDraining(t, c, h1)
 
-	resp, _, err := in.resolveXuantanRoom(xtReq("room", "500"))
+	resp, _, err := in.resolveXuantanMatch(xtReq("room", "500"))
 	require.NoError(t, err)
 	assert.Equal(t, h1, resp.Address, "existing room stays on draining host (sticky)")
 
@@ -511,14 +511,14 @@ func TestXuantanRoomAvoidsDrainingKeepsSticky(t *testing.T) {
 	for i := 501; i <= 506; i++ {
 		id := strconv.Itoa(i)
 		require.NoError(t, c.SAdd(ctx, "xt:dapr:ids:room", id).Err())
-		r, _, err := in.resolveXuantanRoom(xtReq("room", id))
+		r, _, err := in.resolveXuantanMatch(xtReq("room", id))
 		require.NoError(t, err)
 		assert.Equalf(t, h2, r.Address, "new room %s must avoid draining host", id)
 	}
 }
 
 // room：全部 host 都在排空(=全体服务下线) -> 拒绝分配新 room，报可重试错误，且不建绑定。
-func TestXuantanRoomAllDrainingRejected(t *testing.T) {
+func TestXuantanMatchAllDrainingRejected(t *testing.T) {
 	ctx := context.Background()
 	c := xtRedis(t)
 	defer c.Close()
@@ -529,7 +529,7 @@ func TestXuantanRoomAllDrainingRejected(t *testing.T) {
 	require.NoError(t, c.SAdd(ctx, "xt:dapr:ids:room", "900").Err())
 	xtMarkDraining(t, c, h1, h2)
 
-	resp, handled, err := in.resolveXuantanRoom(xtReq("room", "900"))
+	resp, handled, err := in.resolveXuantanMatch(xtReq("room", "900"))
 	require.True(t, handled)
 	require.Error(t, err)
 	require.Nil(t, resp)

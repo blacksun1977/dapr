@@ -24,12 +24,12 @@ host。这对两类业务不可接受：
                              │
                   resolveXuantan(req)      ← 分发器
           ┌──────────────────┼───────────────────┐
-   kind=table             kind=room          其他/未启用
+   kind=battle            kind=match         其他/未启用
           │                  │                    │
- resolveXuantanTable  resolveXuantanRoom   handled=false → 原生哈希
+ resolveXuantanBattle resolveXuantanMatch  handled=false → 原生哈希
 ```
 
-- **分发**：`resolveXuantan` 按 `req.ActorType` 用 `xuantanKindOf` 查到策略种类（`xtKindTable=1` / `xtKindRoom=2`
+- **分发**：`resolveXuantan` 按 `req.ActorType` 用 `xuantanKindOf` 查到策略种类（`xtKindBattle=1` / `xtKindMatch=2`
   ），分发到对应子策略；未受管或未启用返回 `handled=false`，由 Dapr 原生 `resolve` 接管。
 - **返回约定**：`(resp, handled, err)`
     - `handled=false`：本策略不接管（未启用 / 非受管类型），调用方继续走原生哈希。
@@ -68,12 +68,12 @@ dapr:
   key_prefix: "xt:dapr:bind:"    # 绑定 key 前缀（bind）
   ids_prefix: "xt:dapr:ids:"     # room 有效 id 集合（SET）前缀
   bind_ttl: "15m"                # table 绑定 TTL（Go duration，如 15m/1h）；room 无 TTL
-  sticky_type_table:             # 走 table 策略的 actorType 列表
-    - "table_py"
-    - "table"
-  sticky_type_room:              # 走 room 策略的 actorType 列表
-    - "room_py"
-    - "room"
+  sticky_type_battle:            # 走 battle(牌桌) 策略的 actorType 列表
+    - "battle_py"
+    - "battle"
+  sticky_type_match:             # 走 match(房间) 策略的 actorType 列表
+    - "match_py"
+    - "match"
 ```
 
 | 字段                  | 含义                                        | 默认值                |
@@ -82,8 +82,8 @@ dapr:
 | `key_prefix`        | 绑定 key 前缀（bind）                           | `xt:dapr:bind:`    |
 | `ids_prefix`        | room 有效 id 集合（SET）前缀                      | `xt:dapr:ids:`     |
 | `bind_ttl`          | table 绑定 TTL（Go duration，如 `15m`、`1h`）    | `15m`              |
-| `sticky_type_table` | 走 table 策略的 actorType 列表                  | `[table_py, table]` |
-| `sticky_type_room`  | 走 room 策略的 actorType 列表                   | `[room_py, room]`   |
+| `sticky_type_battle` | 走 battle(牌桌) 策略的 actorType 列表          | `[battle_py, battle]` |
+| `sticky_type_match`  | 走 match(房间) 策略的 actorType 列表           | `[match_py, match]`   |
 
 > 业务侧用 `core/infra.NewRedisClient` 据 `redis:` 段建客户端（单/Cluster 自动判定 + 建连 Ping 校验）；
 > daprd 侧读同样的 `redis:` 键、按相同语义构造 `redis.UniversalClient`。
@@ -117,19 +117,19 @@ TTL   = dapr.bind_ttl（默认 15m）
 - room 绑定**无 TTL**，常驻。
 - 负载统计是 **per-actorType**（每张 hash 独立计数）。
 
-## 5. table 策略（`resolveXuantanTable`）
+## 5. battle 策略（`resolveXuantanBattle`）
 
 特点：**有效性门禁 → 初次哈希分配 → 持久化 → 粘性不迁移 → host 失效即拒绝(绝不迁移)**。
 
 **有效性门禁**：牌桌必须先被业务预标记为有效才能分配 host。业务在**预建牌桌实例之前**把绑定 key 置为有效标记
-`"1"`（`core.IManager.MarkTableValid`，SET 带 TTL）；daprd 分配时：
+`"1"`（`core.IManager.MarkBattleValid`，SET 带 TTL）；daprd 分配时：
 
 - 绑定 key **不存在**（未预标记 / 标记已过期）→ 视为无效 tableId，返回哨兵 → 上层报错，**绝不分配 host**；
 - 绑定 key 值为 **`"1"`**（已预标记待分配）→ 门禁通过，进入分配（CAS `"1"` → host）；
 - 绑定 key 值为**存活 host** → 已分配，粘性返回；
 - 绑定 key 值为**失效 host / 脏值** → 无效（牌桌绝不迁移，host 失效即这局不可恢复）→ 报错。
 
-> 与旧版差异：旧版“key 不存在即 SET NX 建绑定”会给任意 tableId 凭空激活牌桌；现要求业务先 `MarkTableValid`。
+> 与旧版差异：旧版“key 不存在即 SET NX 建绑定”会给任意 tableId 凭空激活牌桌；现要求业务先 `MarkBattleValid`。
 > 有效性门禁只在（分配/未命中）路径判定；本地缓存命中(已分配且 host 存活)时零 Redis、直接返回。
 
 流程（**(重)分配只 1 次 Redis 往返**：单脚本一趟完成门禁+粘性+CAS，存活判定在 daprd 侧做，脚本无需知道 ring）：
@@ -164,12 +164,12 @@ return cur                                                    -- 已是某 host/
 > 叠加排空进程缓存，(重)分配从 3 次 RTT（GET+ZRANGEBYSCORE+CAS）降到 **1 次**。
 
 **谁写有效标记**：游戏业务分配 tid（`Mesh().Sequence().NextId("table")`）后、`create.table.ins` 预建牌桌实例
-之前，调 `MarkTableValid(ActorTypeBattlePy, tid)` 写入 `"1"`（见 `game/worker/pypy/create_table.go`）。
+之前，调 `MarkBattleValid(ActorTypeBattlePy, tid)` 写入 `"1"`（见 `game/worker/pypy/create_table.go`）。
 
 **TTL 策略**：绑定与本地缓存条目均为 `BIND_TTL`，且**不做命中续期**——TTL 仅用于无人值守的自动清理。约束：`actor 存活时长 < TTL`
-。牌桌一局 ~5 分钟，小于 15m，正常对局不会过期；业务侧对活跃牌桌可续期（`MarkTableValid` 幂等 EXPIRE）。有效标记 `"1"` 也用同一 TTL 写入，覆盖“预标记→首次分配”窗口。
+。牌桌一局 ~5 分钟，小于 15m，正常对局不会过期；业务侧对活跃牌桌可续期（`MarkBattleValid` 幂等 EXPIRE）。有效标记 `"1"` 也用同一 TTL 写入，覆盖“预标记→首次分配”窗口。
 
-## 6. room 策略（`resolveXuantanRoom`）
+## 6. match 策略（`resolveXuantanMatch`）
 
 特点：**有效性门禁 + 最少负载 + 粘性不迁移 + 无 TTL**。
 
@@ -180,7 +180,7 @@ return cur                                                    -- 已是某 host/
    枚举 ring 内所有存活 host 作为候选集（xuantanRingHosts）
    候选为空 → ErrActorNoAddress（可重试）
    读排空集合(xt:dapr:draining，进程缓存) → 正在排空的 host 列表(dlist)
-   调用 Lua（xuantanRoomBindScript），传入 roomId、dlist、全部存活 host 列表：
+   调用 Lua（xuantanMatchBindScript），传入 roomId、dlist、全部存活 host 列表：
      - 有效性门禁（仅在此分配/未命中路径）：roomId 不在 ids SET → 返回哨兵
        → 上层报 ErrActorNoAddress（无效房间，不建绑定、不激活）
      - 现绑定 host 存活（含正在排空者）→ 直接返回（粘性，排空 host 上的既有 room 不迁移）
@@ -191,7 +191,7 @@ return cur                                                    -- 已是某 host/
    Redis 故障 → handled=true + ErrActorNoAddress(可重试，不降级)
 ```
 
-`xuantanRoomBindScript`（最少负载 + 粘性 + 清理 + 排空过滤）：
+`xuantanMatchBindScript`（最少负载 + 粘性 + 清理 + 排空过滤）：
 
 ```lua
 -- KEYS[1]=bind hash(xt:dapr:bind:<type>)  KEYS[2]=ids set(xt:dapr:ids:<type>)
@@ -260,7 +260,7 @@ bind 字段 `HDEL`，减轻对应 host 负载并自清理。
 - **唯一权威**：Redis 绑定（table 的 string / room 的 hash 字段）是全集群唯一权威。
 - **原子收敛**：table 用 “有效标记 `"1"` CAS（仅当值仍为 `"1"` 才覆盖为 host）” 的 Lua；room 用单条 Lua（HGET 粘性 +
   HGETALL 统计 + HSET）原子完成。并发的多个 daprd 收敛到同一 host。
-- **有效性门禁**：table 要求业务先 `MarkTableValid` 预标记（key 不存在即无效）；room 要求 roomId 在 ids SET 内。
+- **有效性门禁**：table 要求业务先 `MarkBattleValid` 预标记（key 不存在即无效）；room 要求 roomId 在 ids SET 内。
 - **判活复核**：本地缓存每次都用 `xuantanRingHost`（`ring.ReadInternals` 读 `loadMap`）复核存活，host 一旦失效立即弃缓存回
   Redis，不破坏单激活。
 - **存活键绝不重分配** → 正常扩容/滚动更新不触发迁移。
@@ -296,7 +296,7 @@ daprd 侧不负责增删 ids SET，只读取它做有效性校验与自清理。
 业务在**预建牌桌实例之前**把绑定 key 预标记为有效（值 `"1"`）：
 
 ```
-SET xt:dapr:bind:<actorType>:<tableId> 1 EX <bind_ttl>   # 预标记有效（core.IManager.MarkTableValid）
+SET xt:dapr:bind:<actorType>:<tableId> 1 EX <bind_ttl>   # 预标记有效（core.IManager.MarkBattleValid）
 ```
 
 daprd 分配时把 `"1"` CAS 覆盖为实际 host；未预标记（key 不存在）的 tableId 一律拒绝分配。
@@ -309,7 +309,7 @@ daprd 分配时把 `"1"` CAS 覆盖为实际 host；未预标记（key 不存在
 | 本地缓存 GC 周期   | `1min`                                    |
 | table 绑定 TTL | `dapr.bind_ttl`，默认 `15m`，不自动命中续期 |
 | room 绑定 TTL  | 无（常驻，靠重分配/ids 清理）                         |
-| table 有效性门禁 | 业务 `MarkTableValid` 预标记 `"1"`（未标记即拒绝）      |
+| table 有效性门禁 | 业务 `MarkBattleValid` 预标记 `"1"`（未标记即拒绝）      |
 | table 单激活    | Lua CAS（仅当值为 `"1"` 才覆盖为 host）              |
 | room 单激活     | 单条 Lua（HGET 粘性 + 最少负载 HSET）               |
 | 排空索引 key    | `xt:dapr:draining`（ZSET，member=host.Name，score=过期时刻ms） |

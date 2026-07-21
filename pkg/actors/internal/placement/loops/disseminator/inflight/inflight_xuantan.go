@@ -20,13 +20,13 @@ package inflight
 // 一局可达数分钟的场景不可接受。
 //
 // 入口 resolveXuantan 按 actorType 分发到具体子策略(受管类型来自配置文件的两个列表)：
-//   - dapr.sticky_type_table 列表 -> resolveXuantanTable，牌桌粘性(本文件实现)；
-//   - dapr.sticky_type_room  列表 -> resolveXuantanRoom，房间策略(最少负载)。
+//   - dapr.sticky_type_battle 列表 -> resolveXuantanBattle，牌桌粘性(本文件实现)；
+//   - dapr.sticky_type_match  列表 -> resolveXuantanMatch，房间策略(最少负载)。
 //
 // 牌桌(table)策略对受管 actor 类型改为：
 //
 //	⓪ 有效性门禁：分配前先看绑定 key 是否被业务预标记为有效——业务在预建牌桌实例前把
-//	   绑定 key 置为有效标记 "1"(见 core.IManager.MarkTableValid)；key 不存在(未预标记)
+//	   绑定 key 置为有效标记 "1"(见 core.IManager.MarkBattleValid)；key 不存在(未预标记)
 //	   即视为无效 tableId，直接返回异常，绝不分配 host。杜绝任意 tableId 凭空激活牌桌；
 //	① 本地算候选：门禁与选址前先在本地用一致性哈希选一个候选 host cand；若 cand 正在排空
 //	   (命中 xt:dapr:draining 进程缓存)则在非排空存活 host 中确定性改选(仅影响新分配)；
@@ -79,8 +79,8 @@ import (
 
 // 策略种类(kind)，用于在单张映射表里区分 actorType 归属哪个子策略。
 const (
-	xtKindTable = 1 // 牌桌粘性策略
-	xtKindRoom  = 2 // 房间策略(待实现)
+	xtKindBattle = 1 // 牌桌粘性策略
+	xtKindMatch  = 2 // 房间策略(待实现)
 )
 
 const (
@@ -108,15 +108,15 @@ const (
 	envXuantanConfig = "KEY_XT_PLACEMENT_CONFIG"
 
 	// xuantanNotValid 是绑定脚本在「目标 id 无效」时返回的哨兵值，供 Go 侧识别并转成「无效」异常：
-	//   - room：roomId 不在有效集合(ids set)         (xuantanRoomBindScript)；
+	//   - room：roomId 不在有效集合(ids set)         (xuantanMatchBindScript)；
 	//   - table：tableId 未被业务预标记(绑定 key 不存在) (xuantanBindScript)。
 	// 含前导 \0，不可能与真实 host 地址(ip:port)冲突；须与两段 Lua 脚本里的字面量一致。
 	xuantanNotValid = "\x00xt-not-member"
 
-	// xuantanTableValidMark 是「有效牌桌」预标记值：业务在预建牌桌实例前把绑定 key 置为该值
-	// (见 core.IManager.MarkTableValid)，daprd 放置策略据此放行首次 host 分配(CAS 标记->host)；
+	// xuantanBattleValidMark 是「有效牌桌」预标记值：业务在预建牌桌实例前把绑定 key 置为该值
+	// (见 core.IManager.MarkBattleValid)，daprd 放置策略据此放行首次 host 分配(CAS 标记->host)；
 	// 绑定 key 不存在(未预标记)即视为无效 tableId，直接拒绝。须与业务侧 tableValidMark 一致。
-	xuantanTableValidMark = "1"
+	xuantanBattleValidMark = "1"
 
 	// defaultXuantanDrainingKey 排空索引 ZSET 的 key：member=host.Name(ring 地址)，score=过期时刻(ms)。
 	// daprd 进入 block-shutdown 时把自身 host.Name 写入(MarkSelfDraining)，放置策略在(重)分配路径据此
@@ -132,22 +132,22 @@ const (
 	xuantanDrainCacheTTL = time.Second
 )
 
-// defaultXuantanTableType / defaultXuantanRoomType 各策略默认绑定的 actorType 列表；
+// defaultXuantanBattleType / defaultXuantanMatchType 各策略默认绑定的 actorType 列表；
 // 配置文件对应字段为空时使用。须与业务侧 core/actor 默认一致。
 var (
-	defaultXuantanTableType = []string{"table_py", "table"}
-	defaultXuantanRoomType  = []string{"room_py", "room"}
+	defaultXuantanBattleType = []string{"battle_py", "battle"}
+	defaultXuantanMatchType  = []string{"match_py", "match"}
 )
 
 // xuantanConfig 共享配置文件顶层 dapr: 段的解析视图；yaml key 须与业务侧 core/etc
 // DaprConfig 完全一致(见 inflight_xuantan.md)。缺省值在 xuantanInit 里回落，与业务侧对齐。
 type xuantanConfig struct {
-	Redis           xuantanRedisConfig `yaml:"redis"`             // Redis 连接(格式同业务侧 infra.RedisConfig)
-	KeyPrefix       string             `yaml:"key_prefix"`        // 绑定 key 前缀，默认 xt:dapr:bind:
-	IdsPrefix       string             `yaml:"ids_prefix"`        // room 有效 id 集合(SET)前缀，默认 xt:dapr:ids:
-	BindTTL         string             `yaml:"bind_ttl"`          // table 绑定 TTL(Go duration)，默认 15m
-	StickyTypeTable []string           `yaml:"sticky_type_table"` // 走 table 策略的 actorType 列表
-	StickyTypeRoom  []string           `yaml:"sticky_type_room"`  // 走 room 策略的 actorType 列表
+	Redis            xuantanRedisConfig `yaml:"redis"`              // Redis 连接(格式同业务侧 infra.RedisConfig)
+	KeyPrefix        string             `yaml:"key_prefix"`         // 绑定 key 前缀，默认 xt:dapr:bind:
+	IdsPrefix        string             `yaml:"ids_prefix"`         // room 有效 id 集合(SET)前缀，默认 xt:dapr:ids:
+	BindTTL          string             `yaml:"bind_ttl"`           // table 绑定 TTL(Go duration)，默认 15m
+	StickyTypeBattle []string           `yaml:"sticky_type_battle"` // 走 battle(牌桌) 策略的 actorType 列表
+	StickyTypeMatch  []string           `yaml:"sticky_type_match"`  // 走 match(房间) 策略的 actorType 列表
 }
 
 // xuantanRedisConfig 与业务侧 core/infra.RedisConfig 的 yaml 键完全一致，保证两侧共读同一份配置文件
@@ -229,7 +229,7 @@ type xuantanCacheEntry struct {
 // 对返回值的「存活判定」由 daprd 侧本地做（脚本无需知道 ring）。
 //
 //	KEYS[1] = 绑定 key（xt:dapr:bind:<type>:<tableId>）
-//	ARGV[1] = 有效标记 "1"（业务 MarkTableValid 预写的待分配标记，作为 CAS 的 expectedOld）
+//	ARGV[1] = 有效标记 "1"（业务 MarkBattleValid 预写的待分配标记，作为 CAS 的 expectedOld）
 //	ARGV[2] = cand（daprd 本地按哈希+排空过滤选出的候选 host 地址）
 //	ARGV[3] = ttl 秒
 //
@@ -251,7 +251,7 @@ end
 return cur
 `)
 
-// xuantanRoomBindScript 房间(room)的"最少负载 + 粘性"原子分配。
+// xuantanMatchBindScript 房间(room)的"最少负载 + 粘性"原子分配。
 // 全量 room 数很小(<1000)，整张绑定 hash 一次 HGETALL 在脚本内统计即可，无需独立计数器。
 //
 //	KEYS[1] = room 绑定 hash    xt:dapr:bind:<actorType>(field=<roomId>, value=hostAddr，无 TTL)
@@ -269,7 +269,7 @@ return cur
 //     既释放容量又自清理无效绑定；死 host 上的有效 room 不计入负载(待其被请求时重分配)；
 //   - 无绑定 / 绑定 host 已失效 -> 在「非排空」存活 host 中选当前承载最少者(平手按地址名定序)，HSET 覆盖写入并返回；
 //   - 无「非排空」存活 host（全在排空=全体服务下线）或无存活 host -> 返回 ”，由上层报错重试(绝不硬塞到正在排空的 host)。
-var xuantanRoomBindScript = redis.NewScript(`
+var xuantanMatchBindScript = redis.NewScript(`
 local field = ARGV[1]
 if redis.call('SISMEMBER', KEYS[2], field) == 0 then
     return '\0xt-not-member'
@@ -337,8 +337,8 @@ func xuantanInit() {
 		}
 
 		xuantanTypeKinds = nil
-		xuantanTypeKinds = xuantanAppendTypes(xuantanTypeKinds, cfg.StickyTypeTable, defaultXuantanTableType, xtKindTable)
-		xuantanTypeKinds = xuantanAppendTypes(xuantanTypeKinds, cfg.StickyTypeRoom, defaultXuantanRoomType, xtKindRoom)
+		xuantanTypeKinds = xuantanAppendTypes(xuantanTypeKinds, cfg.StickyTypeBattle, defaultXuantanBattleType, xtKindBattle)
+		xuantanTypeKinds = xuantanAppendTypes(xuantanTypeKinds, cfg.StickyTypeMatch, defaultXuantanMatchType, xtKindMatch)
 
 		xuantanKeyPrefix = strings.TrimSpace(cfg.KeyPrefix)
 		if xuantanKeyPrefix == "" {
@@ -435,7 +435,7 @@ func xuantanCacheGC() {
 		now := time.Now()
 		xuantanCache.Range(func(k, v any) bool {
 			// 仅按时间回收 table 条目；room 无 TTL，规模有界，靠 ring 判活惰性淘汰。
-			if e, ok := v.(xuantanCacheEntry); ok && e.kind == xtKindTable && now.Sub(e.at) > xuantanBindTTL {
+			if e, ok := v.(xuantanCacheEntry); ok && e.kind == xtKindBattle && now.Sub(e.at) > xuantanBindTTL {
 				xuantanCache.Delete(k)
 			}
 			return true
@@ -554,24 +554,24 @@ func (i *Inflight) xuantanPickAliveExcluding(ring *hashing.Consistent, actorID s
 //     注意：Redis 故障也返回 handled=true + ErrActorNoAddress(可重试)，而非降级回原生哈希——
 //     降级会破坏粘性(table 迁移)/均衡与容量(room)，故宁可重试也不回退。
 //
-// 按 actorType 分发到具体策略：table -> resolveXuantanTable；room -> resolveXuantanRoom。
+// 按 actorType 分发到具体策略：table -> resolveXuantanBattle；room -> resolveXuantanMatch。
 func (i *Inflight) resolveXuantan(req *api.LookupActorRequest) (*api.LookupActorResponse, bool, error) {
 	if xuantanRDB == nil {
 		return nil, false, nil // 未启用
 	}
 	switch xuantanKindOf(req.ActorType) {
-	case xtKindTable:
-		return i.resolveXuantanTable(req)
-	case xtKindRoom:
-		return i.resolveXuantanRoom(req)
+	case xtKindBattle:
+		return i.resolveXuantanBattle(req)
+	case xtKindMatch:
+		return i.resolveXuantanMatch(req)
 	default:
 		return nil, false, nil // 非受管类型
 	}
 }
 
-// resolveXuantanTable 牌桌(table)粘性放置策略：初次按哈希分配并写 Redis(TTL)，
+// resolveXuantanBattle 牌桌(table)粘性放置策略：初次按哈希分配并写 Redis(TTL)，
 // 之后只要绑定 host 仍存活就一直返回它，host 失效才用哈希 + CAS 重分配。详见文件头注释。
-func (i *Inflight) resolveXuantanTable(req *api.LookupActorRequest) (*api.LookupActorResponse, bool, error) {
+func (i *Inflight) resolveXuantanBattle(req *api.LookupActorRequest) (*api.LookupActorResponse, bool, error) {
 	ring, ok := i.hashTable.Entries[req.ActorType]
 	if !ok {
 		return nil, true, messages.ErrActorNoAddress.WithFormat(req.ActorKey())
@@ -617,7 +617,7 @@ func (i *Inflight) resolveXuantanTable(req *api.LookupActorRequest) (*api.Lookup
 	// ② 单脚本一趟完成「有效性门禁 + 粘性 + CAS 分配」（省去独立 GET，(重)分配从 2 次 RTT 降到 1 次）：
 	//    脚本内 GET 现值——不存在→哨兵；== "1"(有效标记)→CAS 覆盖为 cand 并返回 cand；否则原样返回现值。
 	ttl := strconv.Itoa(int(xuantanBindTTL.Seconds()))
-	res, err := xuantanBindScript.Run(ctx, xuantanRDB, []string{key}, xuantanTableValidMark, cand.Name, ttl).Result()
+	res, err := xuantanBindScript.Run(ctx, xuantanRDB, []string{key}, xuantanBattleValidMark, cand.Name, ttl).Result()
 	if err != nil {
 		// Redis 故障：不降级到原生哈希(会破坏粘性导致迁移)，返回可重试错误等待重试。
 		msg := fmt.Sprintf("xuantan placement: %s %q bind failed: %v", req.ActorKey(), key, err)
@@ -629,18 +629,18 @@ func (i *Inflight) resolveXuantanTable(req *api.LookupActorRequest) (*api.Lookup
 	// ③ 解释脚本返回值（存活判定在 daprd 侧本地做，脚本无需知道 ring）：
 	switch {
 	case finalName == xuantanNotValid:
-		// key 不存在：未被业务预标记为有效(见 MarkTableValid) => 无效 tableId。
+		// key 不存在：未被业务预标记为有效(见 MarkBattleValid) => 无效 tableId。
 		msg := fmt.Sprintf("xuantan placement: %s table not pre-marked valid (key %q missing)", req.ActorKey(), key)
 		log.Warn(msg)
 		return nil, true, messages.ErrActorNoAddress.WithFormat(msg)
 	case finalName == cand.Name:
 		// 我方 CAS 分配成功，或既有绑定恰为本次 cand —— cand 取自存活 ring，必存活，直接采用。
-		xuantanCacheStore(cacheKey, finalName, xtKindTable)
+		xuantanCacheStore(cacheKey, finalName, xtKindBattle)
 		return i.xuantanResp(cand), true, nil
 	default:
 		// 返回的是既有绑定的「其它 host」：存活→粘性返回；失效/脏值→无效（牌桌绝不迁移）。
 		if h, alive := i.xuantanRingHost(ring, finalName); alive {
-			xuantanCacheStore(cacheKey, finalName, xtKindTable)
+			xuantanCacheStore(cacheKey, finalName, xtKindBattle)
 			return i.xuantanResp(h), true, nil
 		}
 		msg := fmt.Sprintf("xuantan placement: %s table invalid bind value %q (host not alive)", req.ActorKey(), finalName)
@@ -649,12 +649,12 @@ func (i *Inflight) resolveXuantanTable(req *api.LookupActorRequest) (*api.Lookup
 	}
 }
 
-// resolveXuantanRoom 房间(room)放置策略：有效性门禁 + 最少负载 + 粘性不迁移、无 TTL。
+// resolveXuantanMatch 房间(room)放置策略：有效性门禁 + 最少负载 + 粘性不迁移、无 TTL。
 //
 // 与 table 的差异：
 //   - 有效性门禁：仅在(重)分配路径(本地缓存未命中，需访问 Redis 定址)才判定 roomId 是否在
 //     有效集合 xt:dapr:ids:<actorType>(业务经 AddIds/SetIds 维护)中——不在集合内即视为无效房间，
-//     直接返回异常(不分配 host、不激活)。该判定折入 xuantanRoomBindScript 原子完成，不加额外往返；
+//     直接返回异常(不分配 host、不激活)。该判定折入 xuantanMatchBindScript 原子完成，不加额外往返；
 //     本地缓存命中(已分配且 host 存活)时零 Redis、直接返回，不再校验。
 //   - 选址不用一致性哈希(roomId 是 <1000 的稀疏小集合，哈希会失衡)，改为在存活 host
 //     中选"当前承载最少者"；
@@ -662,7 +662,7 @@ func (i *Inflight) resolveXuantanTable(req *api.LookupActorRequest) (*api.Lookup
 //   - 扩容(新 host)不自动迁移既有 room，新容量仅承接后续(重)分配，随失效逐步均衡。
 //
 // 稳态同 table：本地缓存命中 + ring 判活，零 Redis；(重)分配仅在首次/绑定 host 失效时发生。
-func (i *Inflight) resolveXuantanRoom(req *api.LookupActorRequest) (*api.LookupActorResponse, bool, error) {
+func (i *Inflight) resolveXuantanMatch(req *api.LookupActorRequest) (*api.LookupActorResponse, bool, error) {
 	ring, ok := i.hashTable.Entries[req.ActorType]
 	if !ok {
 		return nil, true, messages.ErrActorNoAddress.WithFormat(req.ActorKey())
@@ -707,7 +707,7 @@ func (i *Inflight) resolveXuantanRoom(req *api.LookupActorRequest) (*api.LookupA
 	for _, h := range hosts { // ARGV[3+D..]=全部存活 host(含排空)
 		argv = append(argv, h)
 	}
-	res, err := xuantanRoomBindScript.Run(ctx, xuantanRDB, []string{hashKey, idsKey}, argv...).Result()
+	res, err := xuantanMatchBindScript.Run(ctx, xuantanRDB, []string{hashKey, idsKey}, argv...).Result()
 	if err != nil {
 		// Redis 故障：不降级到原生哈希(哈希会失衡)，返回可重试错误等待重试。
 		msg := fmt.Sprintf("xuantan placement: %s room bind failed: %v", req.ActorKey(), err)
@@ -728,7 +728,7 @@ func (i *Inflight) resolveXuantanRoom(req *api.LookupActorRequest) (*api.LookupA
 	}
 
 	if h, alive := i.xuantanRingHost(ring, name); alive {
-		xuantanCacheStore(cacheKey, name, xtKindRoom)
+		xuantanCacheStore(cacheKey, name, xtKindMatch)
 		return i.xuantanResp(h), true, nil
 	}
 	// 选中的 host 恰好在并发下发中失效：返回可重试错误，下次重选。

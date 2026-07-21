@@ -359,10 +359,13 @@ func xuantanInit() {
 			}
 		}
 
+		// 密码为空或仍是未渲染的 ${REDIS_PASSWORD} 占位符时，回退读环境变量（与业务侧 infra 一致）。
+		password := xuantanResolveSecret(cfg.Redis.Password, "REDIS_PASSWORD")
+
 		xuantanRDB = redis.NewUniversalClient(&redis.UniversalOptions{
 			Addrs:        addrs,
 			Username:     cfg.Redis.Username,
-			Password:     cfg.Redis.Password,
+			Password:     password,
 			DB:           cfg.Redis.DB,
 			DialTimeout:  xuantanParseDur(cfg.Redis.DialTimeout, 2*time.Second),
 			ReadTimeout:  xuantanParseDur(cfg.Redis.ReadTimeout, 3*time.Second),
@@ -375,6 +378,24 @@ func xuantanInit() {
 		log.Infof("xuantan placement: enabled from %q, types=%v, redis=%v db=%d ttl=%s bindPrefix=%q idsPrefix=%q",
 			path, xuantanTypeKinds, addrs, cfg.Redis.DB, xuantanBindTTL, xuantanKeyPrefix, xuantanIdsPrefix)
 	})
+}
+
+// xuantanResolveSecret 解析密码类字段：配置为 ${KEY} 占位符时以花括号内的 KEY 作为环境变量名读取其值；
+// 配置为空时回退读默认环境变量 defaultEnvKey；否则原样返回。使部署侧只注入 env 即可，无需渲染配置文件。
+// 语义与业务侧 core/infra.resolveSecretFromEnv 一致（两侧共读同一份 config 的 dapr.redis 段）。
+func xuantanResolveSecret(configVal, defaultEnvKey string) string {
+	v := strings.TrimSpace(configVal)
+	if v == "" {
+		return strings.TrimSpace(os.Getenv(defaultEnvKey))
+	}
+	if strings.HasPrefix(v, "${") && strings.HasSuffix(v, "}") {
+		key := strings.TrimSpace(v[2 : len(v)-1])
+		if key == "" {
+			return ""
+		}
+		return strings.TrimSpace(os.Getenv(key))
+	}
+	return v
 }
 
 // xuantanParseDur 解析 Go duration 字符串，空/非法回落 fallback（与业务侧 infra.parseDur 语义一致）。

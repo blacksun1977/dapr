@@ -79,8 +79,8 @@ import (
 
 // 策略种类(kind)，用于在单张映射表里区分 actorType 归属哪个子策略。
 const (
-	xtKindBattle = 1 // 牌桌粘性策略
-	xtKindMatch  = 2 // 房间策略(待实现)
+	xtKindBattle = 1 // 牌桌粘性策略（resolveXuantanBattle）
+	xtKindMatch  = 2 // 房间策略：最少负载 + 粘性不迁移（resolveXuantanMatch）
 )
 
 const (

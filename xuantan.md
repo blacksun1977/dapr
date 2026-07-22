@@ -92,8 +92,9 @@ dapr_sidecar_injector:
 ### 3.2 启用策略（给 sidecar 注入配置文件路径）
 
 镜像升级后策略默认旁路；要启用，只需给 daprd sidecar 注入**唯一环境变量** `KEY_XT_PLACEMENT_CONFIG`，
-指向一份含顶层 `placement:` 段的共享配置文件（Redis、受管类型、TTL 等所有参数都在文件里，格式见
-inflight_xuantan.md 第 3 节）。该文件与业务侧 `core/actor` 读同一份，保证「同一 Redis、同一 key」。
+指向一份含顶层 `dapr:` 段的共享配置文件（Redis、受管类型 `sticky_type_battle`/`sticky_type_match`、TTL
+`bind_ttl` 等所有参数都在文件里，字段见 `inflight_xuantan.go` 的 `xuantanConfig`）。该文件与业务侧
+`core/actor` 读同一份 `dapr:` 段，保证「同一 Redis、同一 key」。
 
 通过业务 Pod 的注解注入环境变量并把配置文件挂进 sidecar：
 
@@ -140,7 +141,7 @@ kubectl rollout restart deploy/<your-app> -n <ns>
 
 ## 4. 依赖与前置
 
-- 一个可达的 **Redis**（绑定表 / room 有效 id 集合的存储），地址在配置文件 `placement.redis.addresses`。
+- 一个可达的 **Redis**（绑定表 / room 有效 id 集合的存储），地址在配置文件 `dapr.redis.addresses`。
 - room 策略要求外部业务进程维护有效 roomId 集合 `SET xt:dapr:ids:<actorType>`（详见 inflight_xuantan.md 第 10 节）。
 - 集群节点架构与 `ARCH` 一致。
 

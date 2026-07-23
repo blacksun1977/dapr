@@ -185,6 +185,11 @@ var (
 	xuantanKeyPrefix string
 	xuantanIdsPrefix string
 
+	// xuantanCacheGCStop 关停本地缓存 GC goroutine 的信号：xuantanInit 启动 GC，
+	// MarkSelfDraining（进入 block-shutdown 优雅退出）经 xuantanStopCacheGC 关闭它，令 GC 及时收尾。
+	xuantanCacheGCStop     = make(chan struct{})
+	xuantanCacheGCStopOnce sync.Once
+
 	// xuantanDrainingKey 排空索引 ZSET 的实际 key（xuantanInit 时置为 defaultXuantanDrainingKey）。
 	xuantanDrainingKey = defaultXuantanDrainingKey
 
@@ -361,6 +366,7 @@ func xuantanInit() {
 
 		// 密码为空或仍是未渲染的 ${REDIS_PASSWORD} 占位符时，回退读环境变量（与业务侧 infra 一致）。
 		password := xuantanResolveSecret(cfg.Redis.Password, "REDIS_PASSWORD")
+		fmt.Println("password->", password)
 
 		xuantanRDB = redis.NewUniversalClient(&redis.UniversalOptions{
 			Addrs:        addrs,
@@ -373,6 +379,17 @@ func xuantanInit() {
 			PoolSize:     cfg.Redis.PoolSize,
 			MinIdleConns: cfg.Redis.MinIdleConns,
 		})
+
+		// 启动即 PING 一次，尽早暴露连接/认证类异常（如密码错误 ERR invalid password），
+		// 而非拖到首次实际操作（resolve / MarkSelfDraining）才报错。仅打印，不改变启用状态。
+		pingCtx, pingCancel := context.WithTimeout(context.Background(), xuantanRedisOpTimeout)
+		if err := xuantanRDB.Ping(pingCtx).Err(); err != nil {
+			log.Warnf("xuantan placement: redis ping failed: %v (redis=%v db=%d)", err, addrs, cfg.Redis.DB)
+		} else {
+			log.Infof("xuantan placement: redis ping ok (redis=%v db=%d)", addrs, cfg.Redis.DB)
+		}
+		pingCancel()
+
 		go xuantanCacheGC()
 
 		log.Infof("xuantan placement: enabled from %q, types=%v, redis=%v db=%d ttl=%s bindPrefix=%q idsPrefix=%q",
@@ -448,20 +465,31 @@ func xuantanKindOf(actorType string) int {
 }
 
 // xuantanCacheGC 每 xuantanCacheGCInterval 扫描一次本地缓存，删除超过 TTL 的死条目。
-// 仅在策略启用时由 xuantanInit 启动一次，随进程生命周期常驻。
+// 仅在策略启用时由 xuantanInit 启动一次；收到 xuantanCacheGCStop（进入 block-shutdown 优雅退出）即返回。
 func xuantanCacheGC() {
 	t := time.NewTicker(xuantanCacheGCInterval)
 	defer t.Stop()
-	for range t.C {
-		now := time.Now()
-		xuantanCache.Range(func(k, v any) bool {
-			// 仅按时间回收 table 条目；room 无 TTL，规模有界，靠 ring 判活惰性淘汰。
-			if e, ok := v.(xuantanCacheEntry); ok && e.kind == xtKindBattle && now.Sub(e.at) > xuantanBindTTL {
-				xuantanCache.Delete(k)
-			}
-			return true
-		})
+	for {
+		select {
+		case <-xuantanCacheGCStop:
+			return
+		case <-t.C:
+			now := time.Now()
+			xuantanCache.Range(func(k, v any) bool {
+				// 仅按时间回收 table 条目；room 无 TTL，规模有界，靠 ring 判活惰性淘汰。
+				if e, ok := v.(xuantanCacheEntry); ok && e.kind == xtKindBattle && now.Sub(e.at) > xuantanBindTTL {
+					xuantanCache.Delete(k)
+				}
+				return true
+			})
+		}
 	}
+}
+
+// xuantanStopCacheGC 关闭本地缓存 GC goroutine（幂等，可重复/并发调用）。
+// 在进入 block-shutdown 优雅退出（MarkSelfDraining）时调用；策略未启用（GC 未启动）时也安全。
+func xuantanStopCacheGC() {
+	xuantanCacheGCStopOnce.Do(func() { close(xuantanCacheGCStop) })
 }
 
 // xuantanSetSelfHost 记录本 daprd 的 ring Host.Name（= hostname:port），供 MarkSelfDraining 使用。
@@ -478,6 +506,8 @@ func xuantanSetSelfHost(hostname, port string) {
 // ttl 应覆盖 block-shutdown 窗口（建议 = blockShutdownDuration + 余量）；<=0 回退 defaultXuantanDrainTTL。
 func MarkSelfDraining(ctx context.Context, ttl time.Duration) error {
 	xuantanInit()
+	// 进入 block-shutdown 优雅退出：关停本地缓存 GC goroutine（幂等；策略未启用时亦安全）。
+	xuantanStopCacheGC()
 	if xuantanRDB == nil || xuantanSelfHost == "" {
 		return nil
 	}

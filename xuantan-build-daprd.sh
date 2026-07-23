@@ -27,7 +27,7 @@ cd "$(dirname "$0")"
 
 REGISTRY="harbor.ops.tuyoops.com/xuantan"
 IMAGE_NAME="${IMAGE_NAME:-daprd}"
-TAG="${TAG:-xt.1.15.4}"
+TAG="${TAG:-xt.1.15.4.1}"
 ARCHS="${ARCHS:-amd64 arm64}"
 BUILDER="${BUILDER:-poker}"
 PUSH="${PUSH:-true}"

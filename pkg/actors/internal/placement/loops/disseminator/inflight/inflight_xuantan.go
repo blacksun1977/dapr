@@ -366,7 +366,6 @@ func xuantanInit() {
 
 		// 密码为空或仍是未渲染的 ${REDIS_PASSWORD} 占位符时，回退读环境变量（与业务侧 infra 一致）。
 		password := xuantanResolveSecret(cfg.Redis.Password, "REDIS_PASSWORD")
-		fmt.Println("password->", password)
 
 		xuantanRDB = redis.NewUniversalClient(&redis.UniversalOptions{
 			Addrs:        addrs,

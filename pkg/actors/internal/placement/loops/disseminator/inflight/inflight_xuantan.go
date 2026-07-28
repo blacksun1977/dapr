@@ -377,6 +377,7 @@ func xuantanInit() {
 			WriteTimeout: xuantanParseDur(cfg.Redis.WriteTimeout, 3*time.Second),
 			PoolSize:     cfg.Redis.PoolSize,
 			MinIdleConns: cfg.Redis.MinIdleConns,
+			Protocol:     2,
 		})
 
 		// 启动即 PING 一次，尽早暴露连接/认证类异常（如密码错误 ERR invalid password），

@@ -82,6 +82,14 @@ func Run() {
 	// Apply options to all loggers.
 	opts.Logger.SetAppID(opts.AppID)
 
+	// 玄滩定制：--log-file 加时间戳并预建目录。落盘失败不拖垮边车，退回 stdout。
+	if logFile, logErr := resolveXuantanLogFile(opts.Logger.OutputFile); logErr != nil {
+		log.Warnf("Failed to prepare log file, falling back to stdout: %v", logErr)
+		opts.Logger.OutputFile = ""
+	} else {
+		opts.Logger.OutputFile = logFile
+	}
+
 	err = logger.ApplyOptionsToLoggers(&opts.Logger)
 	if err != nil {
 		log.Fatal(err)

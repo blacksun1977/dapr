@@ -27,6 +27,7 @@ import (
 	"github.com/dapr/dapr/pkg/placement"
 	"github.com/dapr/dapr/pkg/placement/monitoring"
 	"github.com/dapr/dapr/pkg/security"
+	"github.com/dapr/dapr/pkg/xuantanlog"
 	"github.com/dapr/kit/concurrency"
 	"github.com/dapr/kit/logger"
 	"github.com/dapr/kit/signals"
@@ -38,6 +39,14 @@ func Run() {
 	opts, err := options.New(os.Args[1:])
 	if err != nil {
 		log.Fatal(err)
+	}
+
+	// 玄滩定制：--log-file 加时间戳并预建目录。落盘失败不拖垮控制面，退回 stdout。
+	if logFile, logErr := xuantanlog.ResolveLogFile(opts.Logger.OutputFile); logErr != nil {
+		log.Warnf("Failed to prepare log file, falling back to stdout: %v", logErr)
+		opts.Logger.OutputFile = ""
+	} else {
+		opts.Logger.OutputFile = logFile
 	}
 
 	// Apply options to all loggers.

@@ -41,6 +41,7 @@ import (
 	"github.com/dapr/dapr/pkg/modes"
 	"github.com/dapr/dapr/pkg/runtime/registry"
 	"github.com/dapr/dapr/pkg/security"
+	"github.com/dapr/dapr/pkg/xuantanlog"
 	"github.com/dapr/kit/concurrency"
 	"github.com/dapr/kit/signals"
 
@@ -83,7 +84,7 @@ func Run() {
 	opts.Logger.SetAppID(opts.AppID)
 
 	// 玄滩定制：--log-file 加时间戳并预建目录。落盘失败不拖垮边车，退回 stdout。
-	if logFile, logErr := resolveXuantanLogFile(opts.Logger.OutputFile); logErr != nil {
+	if logFile, logErr := xuantanlog.ResolveLogFile(opts.Logger.OutputFile); logErr != nil {
 		log.Warnf("Failed to prepare log file, falling back to stdout: %v", logErr)
 		opts.Logger.OutputFile = ""
 	} else {

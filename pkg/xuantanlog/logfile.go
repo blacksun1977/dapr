@@ -11,7 +11,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package app
+// Package xuantanlog 是玄滩(xuantan)对 --log-file 落盘行为的定制，供 daprd / placement 共用。
+package xuantanlog
 
 import (
 	"fmt"
@@ -21,17 +22,17 @@ import (
 	"time"
 )
 
-// resolveXuantanLogFile 把 --log-file 给的「逻辑文件名」改写成带时间戳的实际文件名，并预建目录：
+// ResolveLogFile 把 --log-file 给的「逻辑文件名」改写成带时间戳的实际文件名，并预建目录：
 //
 //	/xt/logs/dapr/biz/xt-user.log → /xt/logs/dapr/biz/xt-user_2026_08_01_204540804.log
 //
 // 两个原因：
 //   - kit 的 setLogOutput 只做 os.OpenFile，父目录不存在即 Fatal；
-//   - 各 daprd 共享同一日志 PVC，固定文件名会让滚动更新期间新旧 Pod 追加进同一文件。
+//   - 多个进程共享同一日志目录，固定文件名会让滚动更新期间新旧 Pod 追加进同一文件。
 //
 // 时间戳格式对齐业务进程的 core/xlog（app.log → app_2026_07_24_010203456.log），便于统一检索。
 // path 为空表示不落文件（kit 回退 stdout），原样返回。
-func resolveXuantanLogFile(path string) (string, error) {
+func ResolveLogFile(path string) (string, error) {
 	if path == "" {
 		return "", nil
 	}
@@ -39,11 +40,11 @@ func resolveXuantanLogFile(path string) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("create log dir %q: %w", dir, err)
 	}
-	return filepath.Join(dir, stampedXuantanLogName(filepath.Base(path), time.Now())), nil
+	return filepath.Join(dir, stampedName(filepath.Base(path), time.Now())), nil
 }
 
-// stampedXuantanLogName 对齐 core/xlog internal.stampedName：app.log → app_2026_07_24_010203456.log。
-func stampedXuantanLogName(filename string, t time.Time) string {
+// stampedName 对齐 core/xlog internal.stampedName：app.log → app_2026_07_24_010203456.log。
+func stampedName(filename string, t time.Time) string {
 	ext := filepath.Ext(filename)
 	base := strings.TrimSuffix(filename, ext)
 	stamp := t.Format("2006_01_02_150405") + fmt.Sprintf("%03d", t.Nanosecond()/1e6)

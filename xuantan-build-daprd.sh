@@ -33,7 +33,7 @@ cd "$(dirname "$0")"
 
 REGISTRY="${REGISTRY:-harbor.ops.tuyoops.com/xuantan}"
 IMAGE_NAME="${IMAGE_NAME:-xtdapr}"
-TAG="${TAG:-v1.4}"
+TAG="${TAG:-v1.5}"
 ARCHS="${ARCHS:-amd64 arm64}"
 BUILDER="${BUILDER:-poker}"
 PUSH="${PUSH:-true}"

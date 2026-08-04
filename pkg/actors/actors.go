@@ -108,11 +108,6 @@ type Interface interface {
 	// 从候选剔除——只拦新分配，既有绑定/粘性不受影响；本 host 离开 ring 后标记靠 score 过期自清。
 	// 未启用玄滩放置策略时为 no-op。ttl 应覆盖 block-shutdown 窗口（建议 = blockShutdownDuration + 余量）。
 	MarkSelfDraining(ctx context.Context, ttl time.Duration) error
-
-	// UnmarkSelfDraining 在 block-shutdown 窗口结束、daprd 真正退出前调用：把本 host 从排空索引移除。
-	// 标记的剩余 TTL 会误伤被 K8s 回收后落到同一 IP 的新 pod，故退出前主动清理。
-	// 未启用玄滩放置策略时为 no-op。
-	UnmarkSelfDraining(ctx context.Context) error
 }
 
 type actors struct {
@@ -558,12 +553,6 @@ func (a *actors) WaitForRegisteredHosts(ctx context.Context) error {
 func (a *actors) MarkSelfDraining(ctx context.Context, ttl time.Duration) error {
 	return inflight.MarkSelfDraining(ctx, ttl)
 }
-
-// UnmarkSelfDraining 见 Interface.UnmarkSelfDraining。actor 运行时未启用时也安全（inflight 侧自判空为 no-op）。
-func (a *actors) UnmarkSelfDraining(ctx context.Context) error {
-	return inflight.UnmarkSelfDraining(ctx)
-}
-
 func (a *actors) RuntimeStatus() *runtimev1pb.ActorRuntime {
 	const placementDisconnected = "placement: disconnected"
 

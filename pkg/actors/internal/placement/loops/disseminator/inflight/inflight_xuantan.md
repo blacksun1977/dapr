@@ -119,7 +119,7 @@ TTL   = dapr.bind_ttl（默认 15m）
 
 ## 5. battle 策略（`resolveXuantanBattle`）
 
-特点：**有效性门禁 → 初次哈希分配 → 持久化 → 粘性不迁移 → host 失效即拒绝(绝不迁移)**。
+特点：**有效性门禁 → 初次哈希分配 → 持久化 → 粘性不迁移 → host 失效即拒绝(绝不迁移)并摘除绑定**。
 
 **有效性门禁**：牌桌必须先被业务预标记为有效才能分配 host。业务在**预建牌桌实例之前**把绑定 key 置为有效标记
 `"1"`（`core.IManager.MarkBattleValid`，SET 带 TTL）；daprd 分配时：
@@ -127,7 +127,7 @@ TTL   = dapr.bind_ttl（默认 15m）
 - 绑定 key **不存在**（未预标记 / 标记已过期）→ 视为无效 tableId，返回哨兵 → 上层报错，**绝不分配 host**；
 - 绑定 key 值为 **`"1"`**（已预标记待分配）→ 门禁通过，进入分配（CAS `"1"` → host）；
 - 绑定 key 值为**存活 host** → 已分配，粘性返回；
-- 绑定 key 值为**失效 host / 脏值** → 无效（牌桌绝不迁移，host 失效即这局不可恢复）→ 报错。
+- 绑定 key 值为**失效 host / 脏值** → 无效（牌桌绝不迁移，host 失效即这局不可恢复）→ 报错，**并 CAS DEL 摘除这条绑定**。
 
 > 与旧版差异：旧版“key 不存在即 SET NX 建绑定”会给任意 tableId 凭空激活牌桌；现要求业务先 `MarkBattleValid`。
 > 有效性门禁只在（分配/未命中）路径判定；本地缓存命中(已分配且 host 存活)时零 Redis、直接返回。
@@ -145,7 +145,8 @@ TTL   = dapr.bind_ttl（默认 15m）
    - 返回哨兵           → key 不存在=未预标记 => 无效 tableId，handled=true + ErrActorNoAddress
    - Redis 故障(脚本报错) → 记日志，handled=true + ErrActorNoAddress(可重试，不降级)
    - 返回 == cand        → 我方 CAS 分配成功 / 既有绑定恰为 cand（取自存活 ring，必存活）→ 回填缓存、采用
-   - 返回其它 host       → 本地判活：存活=粘性返回(不续期)；失效/脏值=无效(牌桌绝不迁移) + ErrActorNoAddress
+   - 返回其它 host       → 本地判活：存活=粘性返回(不续期)；
+                          失效/脏值=无效(牌桌绝不迁移) + ErrActorNoAddress，并 CAS DEL 摘除该绑定
 ```
 
 `xuantanBindScript`（门禁 + 粘性 + 有效标记 CAS，一趟）：
@@ -168,6 +169,26 @@ return cur                                                    -- 已是某 host/
 
 **TTL 策略**：绑定与本地缓存条目均为 `BIND_TTL`，且**不做命中续期**——TTL 仅用于无人值守的自动清理。约束：`actor 存活时长 < TTL`
 。牌桌一局 ~5 分钟，小于 15m，正常对局不会过期；业务侧对活跃牌桌可续期（`MarkBattleValid` 幂等 EXPIRE）。有效标记 `"1"` 也用同一 TTL 写入，覆盖“预标记→首次分配”窗口。
+
+**死绑定摘除**（`xuantanClearDeadBind`）：判定绑定 host 已不在 ring 时，除了拒绝本次定址，还要把这条绑定删掉。
+
+不删的代价不是多一条脏数据，而是**该 tableId 在整个剩余 TTL 内彻底不可用**：`MarkBattleValid` 是 `SET NX`，
+覆盖不了已存在的脏值，业务每次重建都会拿回同一个死 host 而失败，直到 TTL 到期（默认 15m）才自愈。
+
+坏绑定的产生只需要一个很窄的窗口：host 已经退出、但本地 ring 还没收到新表时发起的分配，会把一个刚死的 host
+CAS 进 key（`finalName == cand` 分支不复核存活——cand 取自本地 ring，而本地 ring 可能滞后于 placement 的
+dissemination）。窗口本身是毫秒到秒级，摘除机制的作用就是不让它被 TTL 放大成分钟级故障。
+
+删除用 CAS（`GET` 相符才 `DEL`）而非裸 `DEL`：从读出失效值到发起删除之间，业务可能已重新 `MarkBattleValid`
+写回 `"1"`，或另一个 daprd 已把它 CAS 成新 host，裸 `DEL` 会连这些刚恢复的有效状态一起抹掉。
+
+```lua
+-- KEYS[1]=bindKey  ARGV[1]=期望现值(本次读到的失效 host)
+if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
+return 0
+```
+
+删除失败只告警、不改变返回给调用方的错误：定址本就已失败，且绑定终归会随 TTL 过期。
 
 ## 6. match 策略（`resolveXuantanMatch`）
 
@@ -275,6 +296,7 @@ bind 字段 `HDEL`，减轻对应 host 负载并自清理。
 | ring 无该 actorType / 候选为空 | `ErrActorNoAddress`（可重试）           |
 | 全部存活 host 都在排空（全体下线）  | 拒绝新分配（table/room），`ErrActorNoAddress`（可重试），**绝不硬塞排空 host** |
 | 选中 host 并发下发中失效          | `ErrActorNoAddress`（可重试），下次重选      |
+| table 绑定指向已离开 ring 的 host | `ErrActorNoAddress`（绝不迁移），并 CAS DEL 摘除该绑定，使下次 `MarkBattleValid` 能重新分配 |
 
 > 单次 Redis 操作超时 `xuantanRedisOpTimeout = 2s`，避免抖动阻塞热路径。
 
@@ -332,16 +354,19 @@ daprd 分配时把 `"1"` CAS 覆盖为实际 host；未预标记（key 不存在
 
 **标记的生命周期**：member 是 `ip:port`，而 K8s 会在秒级内把已终止 pod 的 IP 回收给新 pod——若只靠 score 过期，新 pod
 会凭空继承上一代留在同一 IP 上的标记，自己不知情也没人替它清。极端情况下某 actorType 的**全部副本**都被判为排空中，
-建桌/建房被全量拒绝，直到 TTL（分钟级）自然过期才恢复。故标记有三处清理，缺一不可：
+建桌/建房被全量拒绝，直到 TTL（分钟级）自然过期才恢复。清理分两处：
 
 | 时机 | 入口 | 作用 |
 |---|---|---|
 | 进程启动 | `inflight.New` → `xuantanInit` → `xuantanClearSelfDraining` | 摘掉上一代 pod 遗留在本 IP 上的标记；启动是唯一能分清「上一代」与「本代」的时机 |
-| 退出前 | `runtime.go` block 窗口结束 → `actors.Interface.UnmarkSelfDraining` → `inflight.UnmarkSelfDraining` | 本 host 已收完尾、即将离开 ring，主动摘除，不给下一任留残余 TTL |
 | 写入时 | `MarkSelfDraining` 内 `ZREMRANGEBYSCORE(-inf, now)` | 懒清历史过期成员，兜底防 ZSET 无限增长 |
 
-前两者是常态路径，把「陈旧标记」的窗口从分钟级压到接近零；第三者只是兜底（进程被 SIGKILL、OOM 等来不及走退出路径时，
-仍靠 score 过期）。
+> **退出前不清**：曾在 block 窗口结束、进程退出前主动 `ZREM` 自身标记，理由是"马上离开 ring，标记再无意义"。这个判断
+> 是错的，且引发过线上故障。host 离开 ring 不是瞬时的：placement 要把新表 disseminate 到每个 sidecar，实测这段滞后可达
+> **8 秒**（`--disseminate-timeout` 默认值，恰好卡在超时线上）。在这段窗口里，别的 daprd 的本地 ring 仍认为该 host 存活，
+> 而排空标记又已被自己清掉——于是它重新变成一个"完全健康"的候选，被选中并 CAS 写进牌桌绑定，写完 ring 才更新，
+> 绑定就此指向一个不存在的 host。**标记必须活过整个退出过程**：它是这段滞后期内唯一能阻止别人选中将死 host 的东西。
+> IP 复用问题由启动自清完整覆盖——新 pod 起来时摘掉标记，那个时点它确实活着，摘除是安全的。
 
 **候选过滤（策略侧）**：其它 daprd 在**（重）分配路径**读排空集合，把正在排空的 host 从候选剔除：
 

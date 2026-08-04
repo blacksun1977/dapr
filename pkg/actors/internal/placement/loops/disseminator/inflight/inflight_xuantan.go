@@ -34,7 +34,8 @@ package inflight
 //	   (重)分配只 1 次 Redis 往返；存活判定在 daprd 侧对返回值本地做，脚本无需知道 ring；
 //	③ 粘性：脚本返回既有绑定 host，只要它仍在当前成员表(hash ring)里(存活)，就一直返回它，不重新分配；
 //	④ host 失效：绑定的 host 从成员表消失(失效)即视为无效(牌桌绝不迁移、亦不重分配到新 host)，
-//	   返回异常——host 失效意味着这局牌桌已不可恢复。
+//	   返回异常——host 失效意味着这局牌桌已不可恢复；同时就地摘除这条绑定(CAS DEL)，
+//	   否则它会滞留到 TTL 到期，把同一 tableId 的后续建桌一并拖死(见 xuantanClearDeadBind)。
 //
 // 性能：热路径用进程内本地缓存(i.xuantanCache) + ring 本地判活兜底——命中且 host
 // 存活时零 Redis；仅在"本地未缓存 / 缓存过期 / 绑定 host 失效"时才访问 Redis，且(重)分配只 1 次往返。
@@ -254,6 +255,20 @@ if cur == ARGV[1] then
     return ARGV[2]
 end
 return cur
+`)
+
+// xuantanClearDeadBindScript 摘除一条指向已失效 host 的牌桌绑定：仅当现值仍等于期望值才 DEL。
+//
+//	KEYS[1] = 绑定 key（xt:dapr:bind:<type>:<tableId>）
+//	ARGV[1] = 期望现值（本次读到的、host 已不在 ring 的绑定值）
+//
+// 用 CAS 而非裸 DEL：从读出失效值到发起删除之间，业务可能已重新 MarkBattleValid 写回 "1"，
+// 或另一个 daprd 已把它 CAS 成新 host——裸 DEL 会把这些刚恢复的有效状态一并抹掉。
+var xuantanClearDeadBindScript = redis.NewScript(`
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
 `)
 
 // xuantanMatchBindScript 房间(room)的"最少负载 + 粘性"原子分配。
@@ -554,24 +569,6 @@ func MarkSelfDraining(ctx context.Context, ttl time.Duration) error {
 	return nil
 }
 
-// UnmarkSelfDraining 在 block-shutdown 窗口走完、daprd 真正退出前调用：把自身 host.Name 从排空索引移除。
-// 此刻本 host 已经收完尾、马上离开 ring，标记再无意义，而它的剩余 TTL 仍会误伤被 K8s 回收后落到同一
-// IP 的新 pod（见 xuantanClearSelfDraining）。启动自清是兜底，这里主动清理才是常态路径，两者一起
-// 把「陈旧标记」的窗口从分钟级压到接近零。
-//
-// 放置未启用（无 KEY_XT_PLACEMENT_CONFIG / redis 关闭）或 self host 未知时为 no-op。
-func UnmarkSelfDraining(ctx context.Context) error {
-	_ = ctx
-	//if xuantanRDB == nil || xuantanSelfHost == "" {
-	//	return nil
-	//}
-	//if err := xuantanRDB.ZRem(ctx, xuantanDrainingKey, xuantanSelfHost).Err(); err != nil {
-	//	return err
-	//}
-	log.Infof("xuantan placement: self unmarked draining noop host=%q", xuantanSelfHost)
-	return nil
-}
-
 // xuantanDrainingHosts 读排空索引，返回当前仍在排空（score>now）的 host.Name 集合；空/出错返回 nil。
 // 仅在（重）分配路径调用（table 首次 CAS 前 / room 选址前），粘性热路径不调用，故每次读 Redis 可接受。
 func xuantanDrainingHosts(ctx context.Context) map[string]struct{} {
@@ -667,8 +664,8 @@ func (i *Inflight) resolveXuantan(req *api.LookupActorRequest) (*api.LookupActor
 	}
 }
 
-// resolveXuantanBattle 牌桌(table)粘性放置策略：初次按哈希分配并写 Redis(TTL)，
-// 之后只要绑定 host 仍存活就一直返回它，host 失效才用哈希 + CAS 重分配。详见文件头注释。
+// resolveXuantanBattle 牌桌(table)粘性放置策略：初次按哈希分配并写 Redis(TTL)，之后只要绑定 host
+// 仍存活就一直返回它；host 失效则摘除绑定并拒绝本次定址(牌桌绝不迁移)。详见文件头注释。
 func (i *Inflight) resolveXuantanBattle(req *api.LookupActorRequest) (*api.LookupActorResponse, bool, error) {
 	ring, ok := i.hashTable.Entries[req.ActorType]
 	if !ok {
@@ -741,9 +738,32 @@ func (i *Inflight) resolveXuantanBattle(req *api.LookupActorRequest) (*api.Looku
 			xuantanCacheStore(cacheKey, finalName, xtKindBattle)
 			return i.xuantanResp(h), true, nil
 		}
+		// 绑定 host 已离开 ring：这条绑定再无翻身可能——牌桌绝不迁移，本次定址必然拒绝，
+		// 之后每次读到它也只会得到同样的结果。就地摘掉，别让它耗到 TTL 到期。
+		xuantanClearDeadBind(ctx, key, finalName)
 		msg := fmt.Sprintf("xuantan placement: %s table invalid bind value %q (host not alive)", req.ActorKey(), finalName)
 		log.Warn(msg)
 		return nil, true, messages.ErrActorNoAddress.WithFormat(msg)
+	}
+}
+
+// xuantanClearDeadBind 摘除指向已失效 host 的牌桌绑定，使该 tableId 能被重新预标记、重新分配。
+//
+// 不清理的代价不是"多一条脏数据"，而是这个 tableId 在整个剩余 TTL(默认 15m)内彻底不可用：
+// MarkBattleValid 是 SET NX，覆盖不了已存在的脏值，于是业务每次重建都拿回同一个死 host 而失败。
+// 坏绑定的产生只需要一个很窄的窗口——host 已退出、本地 ring 尚未收到新表时发起的分配，就会把
+// 一个刚死的 host 写进 key（见 dissemination 滞后）；窗口是毫秒到秒级，故障却被放大成分钟级。
+//
+// 删除失败只告警不改变返回值：定址本就已经失败，且绑定终归会随 TTL 过期，没必要让清理的成败
+// 影响给调用方的错误。
+func xuantanClearDeadBind(ctx context.Context, key, dead string) {
+	res, err := xuantanClearDeadBindScript.Run(ctx, xuantanRDB, []string{key}, dead).Result()
+	if err != nil {
+		log.Warnf("xuantan placement: clear dead bind %q (host %q) failed: %v", key, dead, err)
+		return
+	}
+	if n, _ := res.(int64); n > 0 {
+		log.Infof("xuantan placement: cleared dead bind %q that pointed at departed host %q", key, dead)
 	}
 }
 

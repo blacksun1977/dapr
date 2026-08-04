@@ -233,10 +233,73 @@ func TestXuantanBattleAssignStickyReject(t *testing.T) {
 	assert.Error(t, err3)
 	assert.Nil(t, resp3)
 
-	// Redis 中的绑定不被改写(仍指向失效 host)。
-	got2, err := c.Get(ctx, "xt:dapr:bind:table:100001").Result()
+	// 绝不改写成新 host(那就是迁移)，但要就地摘除：留着只会让后续 MarkBattleValid(SET NX)
+	// 覆盖不掉，把这个 tableId 一直卡到 TTL 到期。
+	ex, err := c.Exists(ctx, "xt:dapr:bind:table:100001").Result()
 	require.NoError(t, err)
-	assert.Equal(t, first, got2)
+	assert.EqualValues(t, 0, ex, "dead bind should be cleared, not left to expire")
+}
+
+// table：死绑定被摘除后，业务重新预标记即可重新分配到存活 host——坏绑定不再把 tableId 锁死一个 TTL。
+func TestXuantanBattleDeadBindClearedAllowsRebind(t *testing.T) {
+	ctx := context.Background()
+	c := xtRedis(t)
+	defer c.Close()
+	xtSetup(c)
+
+	h1, h2, h3 := "10.0.0.1:7", "10.0.0.2:7", "10.0.0.3:7"
+	key := "xt:dapr:bind:table:100002"
+	in := xtInflight("table", xtRing(h1, h2, h3))
+	req := xtReq("table", "100002")
+
+	require.NoError(t, c.Set(ctx, key, xuantanBattleValidMark, 0).Err())
+	resp, _, err := in.resolveXuantanBattle(req)
+	require.NoError(t, err)
+	first := resp.Address
+
+	// 被分配的 host 离开 ring：本次定址失败，同时绑定被摘除。
+	live := xtExclude(first, h1, h2, h3)
+	in = xtInflight("table", xtRing(live...))
+	xtClearCache()
+	_, _, err = in.resolveXuantanBattle(req)
+	require.Error(t, err)
+	require.ErrorIs(t, c.Get(ctx, key).Err(), redis.Nil, "dead bind should be cleared")
+
+	// 业务重新预标记(SET NX 此刻能成功，因为脏值已清)，分配落到仍存活的 host。
+	ok, err := c.SetNX(ctx, key, xuantanBattleValidMark, xuantanBindTTL).Result()
+	require.NoError(t, err)
+	require.True(t, ok, "SET NX should succeed once the dead bind is gone")
+
+	xtClearCache()
+	resp2, _, err := in.resolveXuantanBattle(req)
+	require.NoError(t, err)
+	require.NotNil(t, resp2)
+	assert.Contains(t, live, resp2.Address)
+	assert.NotEqual(t, first, resp2.Address)
+}
+
+// table：摘除死绑定用 CAS——若期间业务已重新预标记回 "1"，不得把这个有效状态误删。
+func TestXuantanClearDeadBindIsCAS(t *testing.T) {
+	ctx := context.Background()
+	c := xtRedis(t)
+	defer c.Close()
+	xtSetup(c)
+
+	key := "xt:dapr:bind:table:100003"
+	require.NoError(t, c.Set(ctx, key, xuantanBattleValidMark, 0).Err())
+
+	// 期望值与现值不符(现值是刚写回的 "1")：不应删除。
+	xuantanClearDeadBind(ctx, key, "10.0.0.9:7")
+	got, err := c.Get(ctx, key).Result()
+	require.NoError(t, err)
+	assert.Equal(t, xuantanBattleValidMark, got, "re-marked key must survive a stale clear")
+
+	// 期望值与现值一致：删除。
+	require.NoError(t, c.Set(ctx, key, "10.0.0.9:7", 0).Err())
+	xuantanClearDeadBind(ctx, key, "10.0.0.9:7")
+	ex, err := c.Exists(ctx, key).Result()
+	require.NoError(t, err)
+	assert.EqualValues(t, 0, ex)
 }
 
 // table：未预标记(绑定 key 不存在)的 tableId -> 有效性门禁直接拒绝，且不建立任何绑定。
@@ -557,8 +620,9 @@ func TestXuantanMarkSelfDraining(t *testing.T) {
 	assert.True(t, ok, "self host should be in draining set")
 }
 
-// UnmarkSelfDraining：block 窗口走完后主动摘掉自身标记，不留残余 TTL 误伤复用同一 IP 的新 pod。
-func TestXuantanUnmarkSelfDraining(t *testing.T) {
+// 排空标记必须活过整个退出过程：host 从 ring 上消失要等 placement 把新表下发到各 sidecar，
+// 在那之前标记是唯一能阻止别人把这个将死 host 选为候选的东西，故退出前不得主动摘除。
+func TestXuantanSelfDrainingSurvivesShutdown(t *testing.T) {
 	ctx := context.Background()
 	c := xtRedis(t)
 	defer c.Close()
@@ -569,11 +633,10 @@ func TestXuantanUnmarkSelfDraining(t *testing.T) {
 	xuantanSetSelfHost("10.9.9.9", "7000")
 
 	require.NoError(t, MarkSelfDraining(ctx, 5*time.Minute))
-	require.NoError(t, UnmarkSelfDraining(ctx))
 
 	xuantanDrainCache.Store(nil)
 	_, ok := xuantanDrainingHosts(ctx)["10.9.9.9:7000"]
-	assert.False(t, ok, "self host should be gone from draining set after unmark")
+	assert.True(t, ok, "draining mark must outlive the process so a lagging ring can't pick this host")
 }
 
 // 启动自清：新 pod 复用了上一代 pod 的 IP，会凭空继承其排空标记；inflight.New 起来时必须清掉。

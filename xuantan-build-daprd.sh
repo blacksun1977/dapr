@@ -33,7 +33,7 @@ cd "$(dirname "$0")"
 
 REGISTRY="${REGISTRY:-harbor.ops.tuyoops.com/xuantan}"
 IMAGE_NAME="${IMAGE_NAME:-xtdapr}"
-TAG="${TAG:-v1.5}"
+TAG="${TAG:-v1.6}"
 ARCHS="${ARCHS:-amd64 arm64}"
 BUILDER="${BUILDER:-poker}"
 PUSH="${PUSH:-true}"
@@ -104,7 +104,7 @@ ENV DOCKER_CLI_HINTS=false
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         locales ca-certificates curl wget tree \
-        iputils-ping net-tools iproute2 telnet vim psmisc htop \
+        iputils-ping net-tools iproute2 telnet vim psmisc htop procps \
     && sed -i 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen \
     && locale-gen en_US.UTF-8 \
     && update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 \

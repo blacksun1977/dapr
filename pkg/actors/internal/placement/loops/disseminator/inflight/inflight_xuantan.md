@@ -324,12 +324,24 @@ daprd 分配时把 `"1"` CAS 覆盖为实际 host；未预标记（key 不存在
 原生策略仍会把「新 actor」分配上来——但它马上就要退出，属于无效分配。排空机制解决这个问题：
 
 **自标记（daprd 侧）**：daprd 一进入 block-shutdown 窗口，就把**自身 ring 地址** `host.Name`（`hostname:port`）写入排空索引
-`xt:dapr:draining`（ZSET，score = now + ttl）。ttl 取 `blockShutdownDuration + 余量`，确保覆盖整个 block 窗口；host 离开
-ring 后该条目靠 score 过期自清，读取方也顺带 `ZREMRANGEBYSCORE` 懒清历史成员。
+`xt:dapr:draining`（ZSET，score = now + ttl）。ttl 取 `blockShutdownDuration + 余量`，确保覆盖整个 block 窗口。
 
 - 接入点：`runtime.go` block-shutdown 分支 → `actors.Interface.MarkSelfDraining(ttl)` → `inflight.MarkSelfDraining`。
-- 自身地址来源：`inflight.New(Options{Hostname,Port})` 时经 `xuantanSetSelfHost` 记为进程内单值 `xuantanSelfHost`。
+- 自身地址来源：`inflight.New(Options{Hostname,Port})` → `xuantanInit(hostname, port)` 记为进程内单值 `xuantanSelfHost`。
 - 未启用玄滩放置（无 `KEY_XT_PLACEMENT_CONFIG` / redis 关闭）时整体 no-op。
+
+**标记的生命周期**：member 是 `ip:port`，而 K8s 会在秒级内把已终止 pod 的 IP 回收给新 pod——若只靠 score 过期，新 pod
+会凭空继承上一代留在同一 IP 上的标记，自己不知情也没人替它清。极端情况下某 actorType 的**全部副本**都被判为排空中，
+建桌/建房被全量拒绝，直到 TTL（分钟级）自然过期才恢复。故标记有三处清理，缺一不可：
+
+| 时机 | 入口 | 作用 |
+|---|---|---|
+| 进程启动 | `inflight.New` → `xuantanInit` → `xuantanClearSelfDraining` | 摘掉上一代 pod 遗留在本 IP 上的标记；启动是唯一能分清「上一代」与「本代」的时机 |
+| 退出前 | `runtime.go` block 窗口结束 → `actors.Interface.UnmarkSelfDraining` → `inflight.UnmarkSelfDraining` | 本 host 已收完尾、即将离开 ring，主动摘除，不给下一任留残余 TTL |
+| 写入时 | `MarkSelfDraining` 内 `ZREMRANGEBYSCORE(-inf, now)` | 懒清历史过期成员，兜底防 ZSET 无限增长 |
+
+前两者是常态路径，把「陈旧标记」的窗口从分钟级压到接近零；第三者只是兜底（进程被 SIGKILL、OOM 等来不及走退出路径时，
+仍靠 score 过期）。
 
 **候选过滤（策略侧）**：其它 daprd 在**（重）分配路径**读排空集合，把正在排空的 host 从候选剔除：
 

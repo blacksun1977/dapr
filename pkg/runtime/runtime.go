@@ -546,6 +546,14 @@ func (a *DaprRuntime) Run(parentCtx context.Context) error {
 				log.Info("App reported unhealthy, entering shutdown...")
 			}
 
+			// 玄滩自定义放置：block 窗口已走完、本 host 即将离开 ring，排空标记再无意义。
+			// 主动清掉它，否则剩余 TTL 会误伤被 K8s 回收后落到同一 IP 的新 pod。
+			unmarkCtx, unmarkCancel := context.WithTimeout(context.Background(), 3*time.Second)
+			if uerr := a.actors.UnmarkSelfDraining(unmarkCtx); uerr != nil {
+				log.Warnf("xuantan placement: unmark self draining failed: %v", uerr)
+			}
+			unmarkCancel()
+
 			return nil
 		})
 	}

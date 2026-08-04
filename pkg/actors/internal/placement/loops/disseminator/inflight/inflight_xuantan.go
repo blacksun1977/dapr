@@ -320,11 +320,15 @@ redis.call('HSET', KEYS[1], field, best)
 return best
 `)
 
-// xuantanInit 惰性初始化 Redis 客户端与受管类型集合（进程内仅一次）。
+// xuantanInit 惰性初始化本 daprd 的 ring 地址、Redis 客户端与受管类型集合（进程内仅一次），由 inflight.New 调用。
+// hostname/port 即本 daprd 在 ring 中的 Host.Name 构成部分。
 // 未配置 KEY_XT_PLACEMENT_CONFIG（或文件里 dapr.redis.addresses 为空 / 读取解析失败）时 xuantanRDB 保持 nil，
 // 策略整体旁路，回退 Dapr 原生哈希。
-func xuantanInit() {
+func xuantanInit(hostname, port string) {
 	xuantanOnce.Do(func() {
+		// ring 地址是纯本地信息，与配置是否可用无关，先记下：供 MarkSelfDraining 自标记排空使用。
+		xuantanSetSelfHost(hostname, port)
+
 		path := strings.TrimSpace(os.Getenv(envXuantanConfig))
 		if path == "" {
 			log.Info("xuantan placement: disabled (no KEY_XT_PLACEMENT_CONFIG), using stock hashing")
@@ -391,6 +395,9 @@ func xuantanInit() {
 		pingCancel()
 
 		go xuantanCacheGC()
+
+		// 摘掉上一代 pod 可能留在同一 IP 上的排空标记。须在 Redis 就绪之后、任何分配请求到来之前。
+		xuantanClearSelfDraining()
 
 		log.Infof("xuantan placement: enabled from %q, types=%v, redis=%v db=%d ttl=%s bindPrefix=%q idsPrefix=%q",
 			path, xuantanTypeKinds, addrs, cfg.Redis.DB, xuantanBindTTL, xuantanKeyPrefix, xuantanIdsPrefix)
@@ -493,9 +500,32 @@ func xuantanStopCacheGC() {
 }
 
 // xuantanSetSelfHost 记录本 daprd 的 ring Host.Name（= hostname:port），供 MarkSelfDraining 使用。
-// 由 inflight.New 调用；进程内仅一个 disseminator Inflight，最后一次写入即当前 daprd 的自身地址。
+// 由 xuantanInit 调用；进程内仅一个 disseminator Inflight，故用全局单值。
 func xuantanSetSelfHost(hostname, port string) {
 	xuantanSelfHost = net.JoinHostPort(hostname, port)
+}
+
+// xuantanClearSelfDraining 启动时把自身 host.Name 从排空索引里摘掉，由 xuantanInit 在 Redis 就绪后调用一次。
+//
+// 排空标记以 ip:port 为 member、TTL 长达 blockShutdownDuration+余量（分钟级），而 K8s 会在秒级内
+// 把已终止 pod 的 IP 回收给新 pod。新 pod 若落在刚排空过的 IP 上，就会凭空继承上一代的标记：它自己
+// 不知情，也没有任何一方会替它清理，最坏情况下某个 actorType 的全部副本都被判为「排空中」，
+// resolveXuantanBattle/Match 于是拒绝一切新分配。进程启动是唯一能分清「上一代」与「本代」的时机，
+// 故在此无条件自清。
+func xuantanClearSelfDraining() {
+	if xuantanRDB == nil || xuantanSelfHost == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), xuantanRedisOpTimeout)
+	defer cancel()
+	removed, err := xuantanRDB.ZRem(ctx, xuantanDrainingKey, xuantanSelfHost).Result()
+	if err != nil {
+		log.Warnf("xuantan placement: clear self draining mark host=%q failed: %v", xuantanSelfHost, err)
+		return
+	}
+	if removed > 0 {
+		log.Infof("xuantan placement: cleared stale draining mark on host=%q left by a previous pod", xuantanSelfHost)
+	}
 }
 
 // MarkSelfDraining 在本 daprd 进入优雅退出（block-shutdown 窗口起点）时调用：把自身 host.Name 写入排空索引
@@ -505,7 +535,6 @@ func xuantanSetSelfHost(hostname, port string) {
 // 放置未启用（无 KEY_XT_PLACEMENT_CONFIG / redis 关闭）或 self host 未知时为 no-op。
 // ttl 应覆盖 block-shutdown 窗口（建议 = blockShutdownDuration + 余量）；<=0 回退 defaultXuantanDrainTTL。
 func MarkSelfDraining(ctx context.Context, ttl time.Duration) error {
-	xuantanInit()
 	// 进入 block-shutdown 优雅退出：关停本地缓存 GC goroutine（幂等；策略未启用时亦安全）。
 	xuantanStopCacheGC()
 	if xuantanRDB == nil || xuantanSelfHost == "" {
@@ -522,6 +551,23 @@ func MarkSelfDraining(ctx context.Context, ttl time.Duration) error {
 		return err
 	}
 	log.Infof("xuantan placement: self marked draining host=%q ttl=%s", xuantanSelfHost, ttl)
+	return nil
+}
+
+// UnmarkSelfDraining 在 block-shutdown 窗口走完、daprd 真正退出前调用：把自身 host.Name 从排空索引移除。
+// 此刻本 host 已经收完尾、马上离开 ring，标记再无意义，而它的剩余 TTL 仍会误伤被 K8s 回收后落到同一
+// IP 的新 pod（见 xuantanClearSelfDraining）。启动自清是兜底，这里主动清理才是常态路径，两者一起
+// 把「陈旧标记」的窗口从分钟级压到接近零。
+//
+// 放置未启用（无 KEY_XT_PLACEMENT_CONFIG / redis 关闭）或 self host 未知时为 no-op。
+func UnmarkSelfDraining(ctx context.Context) error {
+	if xuantanRDB == nil || xuantanSelfHost == "" {
+		return nil
+	}
+	if err := xuantanRDB.ZRem(ctx, xuantanDrainingKey, xuantanSelfHost).Err(); err != nil {
+		return err
+	}
+	log.Infof("xuantan placement: self unmarked draining host=%q", xuantanSelfHost)
 	return nil
 }
 

@@ -557,6 +557,50 @@ func TestXuantanMarkSelfDraining(t *testing.T) {
 	assert.True(t, ok, "self host should be in draining set")
 }
 
+// UnmarkSelfDraining：block 窗口走完后主动摘掉自身标记，不留残余 TTL 误伤复用同一 IP 的新 pod。
+func TestXuantanUnmarkSelfDraining(t *testing.T) {
+	ctx := context.Background()
+	c := xtRedis(t)
+	defer c.Close()
+	xtSetup(c)
+
+	oldSelf := xuantanSelfHost
+	t.Cleanup(func() { xuantanSelfHost = oldSelf })
+	xuantanSetSelfHost("10.9.9.9", "7000")
+
+	require.NoError(t, MarkSelfDraining(ctx, 5*time.Minute))
+	require.NoError(t, UnmarkSelfDraining(ctx))
+
+	xuantanDrainCache.Store(nil)
+	_, ok := xuantanDrainingHosts(ctx)["10.9.9.9:7000"]
+	assert.False(t, ok, "self host should be gone from draining set after unmark")
+}
+
+// 启动自清：新 pod 复用了上一代 pod 的 IP，会凭空继承其排空标记；inflight.New 起来时必须清掉。
+// 别的 host 的标记不能被误删。
+func TestXuantanClearSelfDrainingOnStart(t *testing.T) {
+	ctx := context.Background()
+	c := xtRedis(t)
+	defer c.Close()
+	xtSetup(c)
+
+	oldSelf := xuantanSelfHost
+	t.Cleanup(func() { xuantanSelfHost = oldSelf })
+
+	// 上一代 pod 排空时留下的标记，本代新 pod 恰好拿到同一个 IP。
+	xtMarkDraining(t, c, "10.9.9.9:7000", "10.8.8.8:7000")
+
+	xuantanSetSelfHost("10.9.9.9", "7000")
+	xuantanClearSelfDraining()
+
+	xuantanDrainCache.Store(nil)
+	set := xuantanDrainingHosts(ctx)
+	_, self := set["10.9.9.9:7000"]
+	assert.False(t, self, "inherited draining mark on own host should be cleared at startup")
+	_, other := set["10.8.8.8:7000"]
+	assert.True(t, other, "other hosts' draining marks must not be touched")
+}
+
 // 排空缓存(优化A)：首次读回填缓存；TTL 内即便 Redis 变了也返回旧快照（可容忍的 ≤TTL 陈旧）；
 // 缓存重置后再读拿到最新。
 func TestXuantanDrainCacheTTL(t *testing.T) {

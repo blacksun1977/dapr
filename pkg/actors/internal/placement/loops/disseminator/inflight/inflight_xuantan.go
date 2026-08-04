@@ -561,13 +561,14 @@ func MarkSelfDraining(ctx context.Context, ttl time.Duration) error {
 //
 // 放置未启用（无 KEY_XT_PLACEMENT_CONFIG / redis 关闭）或 self host 未知时为 no-op。
 func UnmarkSelfDraining(ctx context.Context) error {
-	if xuantanRDB == nil || xuantanSelfHost == "" {
-		return nil
-	}
-	if err := xuantanRDB.ZRem(ctx, xuantanDrainingKey, xuantanSelfHost).Err(); err != nil {
-		return err
-	}
-	log.Infof("xuantan placement: self unmarked draining host=%q", xuantanSelfHost)
+	_ = ctx
+	//if xuantanRDB == nil || xuantanSelfHost == "" {
+	//	return nil
+	//}
+	//if err := xuantanRDB.ZRem(ctx, xuantanDrainingKey, xuantanSelfHost).Err(); err != nil {
+	//	return err
+	//}
+	log.Infof("xuantan placement: self unmarked draining noop host=%q", xuantanSelfHost)
 	return nil
 }
 

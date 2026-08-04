@@ -90,14 +90,39 @@ docker buildx build \
   -t "${IMAGE}" \
   -f - \
   dist <<'DOCKERFILE'
-FROM gcr.io/distroless/static:nonroot
+FROM debian:bookworm-slim
 ARG TARGETARCH
 WORKDIR /
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Asia/Shanghai
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
+ENV LANGUAGE=en_US.UTF-8
+ENV DOCKER_CLI_HINTS=false
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        locales ca-certificates curl wget tree \
+        iputils-ping net-tools iproute2 telnet vim psmisc htop \
+    && sed -i 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen \
+    && locale-gen en_US.UTF-8 \
+    && update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN echo "alias ll='ls -l'" >> /etc/bash.bashrc \
+    && echo "export TZ=Asia/Shanghai" >> /etc/bash.bashrc \
+    && echo "export LANG=en_US.UTF-8" >> /etc/bash.bashrc \
+    && echo "export LC_ALL=en_US.UTF-8" >> /etc/bash.bashrc \
+    && echo "export LANGUAGE=en_US.UTF-8" >> /etc/bash.bashrc \
+    && echo "export DOCKER_CLI_HINTS=false" >> /etc/bash.bashrc
+
 # 同镜像内放两个二进制：daprd(sidecar) 与 placement(控制面)。
 # 不设 ENTRYPOINT：由各消费方(daprd 注入器 / placement StatefulSet) 显式指定 command。
+# 调试友好镜像(含 shell/vim)，保持 root 运行以便排查；未再切到 distroless nonroot。
 COPY /linux_${TARGETARCH}/release/daprd /
 COPY /linux_${TARGETARCH}/release/placement /
-USER 65532:65532
 DOCKERFILE
 
 echo

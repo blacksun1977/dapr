@@ -67,6 +67,8 @@ type Options struct {
 	Backend       *string
 	BackendConfig any
 
+	PlacementEnabled bool
+
 	EtcdEmbed                      bool
 	EtcdDataDir                    string
 	EtcdName                       string
@@ -100,7 +102,6 @@ type Server struct {
 	serializer *serialize.Serializer
 	cron       cron.Interface
 	etcd       etcd.Interface
-	controller *controller.Controller
 
 	hzAPIServer healthz.Target
 
@@ -176,7 +177,6 @@ func New(ctx context.Context, opts Options) (*Server, error) {
 		port:          opts.Port,
 		listenAddress: opts.ListenAddress,
 		sec:           opts.Security,
-		controller:    opts.Controller,
 		cron:          cron,
 		etcd:          etcdServer,
 		serializer: serialize.New(serialize.Options{
@@ -211,10 +211,6 @@ func (s *Server) Run(ctx context.Context) error {
 			close(s.closeCh)
 			return nil
 		},
-	}
-
-	if s.controller != nil {
-		runners = append(runners, s.controller.Run)
 	}
 
 	if s.etcd != nil {

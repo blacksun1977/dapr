@@ -119,6 +119,9 @@ func New(t *testing.T, fopts ...Option) *Daprd {
 	if opts.appPort != nil {
 		args = append(args, "--app-port="+strconv.Itoa(*opts.appPort))
 	}
+	if opts.appMaxConcurrency != nil {
+		args = append(args, "--app-max-concurrency="+strconv.Itoa(*opts.appMaxConcurrency))
+	}
 	if opts.appHealthCheckPath != "" {
 		args = append(args, "--app-health-check-path="+opts.appHealthCheckPath)
 	}
@@ -448,6 +451,10 @@ func (d *Daprd) GetMetaSubscriptions(t assert.TestingT, ctx context.Context) []M
 	return d.meta(t, ctx).Subscriptions
 }
 
+func (d *Daprd) GetMetaEnabledFeatures(t assert.TestingT, ctx context.Context) []string {
+	return d.meta(t, ctx).EnabledFeatures
+}
+
 func (d *Daprd) GetMetaSubscriptionsWithType(t assert.TestingT, ctx context.Context, subType string) []MetadataResponsePubsubSubscription {
 	subs := d.GetMetaSubscriptions(t, ctx)
 	var filteredSubs []MetadataResponsePubsubSubscription
@@ -498,6 +505,7 @@ type Metadata struct {
 	Workflows              *MetadataWorkflows                   `json:"workflows"`
 	WorkflowAccessPolicies []*rtv1.MetadataWorkflowAccessPolicy `json:"workflowAccessPolicies,omitempty"`
 	Resiliencies           []*rtv1.MetadataResiliency           `json:"resiliencies,omitempty"`
+	EnabledFeatures        []string                             `json:"enabledFeatures,omitempty"`
 }
 
 // MetadataResponsePubsubSubscription copied from pkg/api/http/metadata.go:172 to be able to use in integration tests until we move to Proto format
@@ -557,6 +565,14 @@ func (d *Daprd) ActorReminderURL(actorType, actorID, method string) string {
 	return fmt.Sprintf("http://%s/v1.0/actors/%s/%s/reminders/%s", d.HTTPAddress(), actorType, actorID, method)
 }
 
+func (d *Daprd) ActorTimerURL(actorType, actorID, name string) string {
+	return fmt.Sprintf("http://%s/v1.0/actors/%s/%s/timers/%s", d.HTTPAddress(), actorType, actorID, name)
+}
+
+func (d *Daprd) ActorTimersURL(actorType, actorID string) string {
+	return fmt.Sprintf("http://%s/v1.0/actors/%s/%s/timers", d.HTTPAddress(), actorType, actorID)
+}
+
 func (d *Daprd) Kill(t *testing.T) {
 	t.Helper()
 	d.exec.Kill(t)
@@ -566,6 +582,17 @@ func (d *Daprd) Restart(t *testing.T, ctx context.Context) {
 	t.Helper()
 	clone := d.exec.Clone(t)
 	d.exec.Kill(t)
+	d.exec = clone
+	d.exec.Run(t, ctx)
+}
+
+// RestartGraceful is Restart with an interrupt and exit wait instead of a hard
+// kill, for tests that need the shutdown path (actor HaltAll, drains) to run
+// before the new process starts.
+func (d *Daprd) RestartGraceful(t *testing.T, ctx context.Context) {
+	t.Helper()
+	clone := d.exec.Clone(t)
+	d.exec.Cleanup(t)
 	d.exec = clone
 	d.exec.Run(t, ctx)
 }
@@ -581,4 +608,31 @@ func (d *Daprd) ReplaceArg(t *testing.T, flag, value string) {
 func (d *Daprd) SignalHUP(t *testing.T) {
 	t.Helper()
 	d.exec.SignalHUP(t)
+}
+
+// ActiveActorCount returns the number of live actors of actorType reported by
+// the actor runtime, and whether the type is hosted at all.
+func (d *Daprd) ActiveActorCount(t assert.TestingT, ctx context.Context, actorType string) (int, bool) {
+	for _, a := range d.GetMetaActorRuntime(t, ctx).ActiveActors {
+		if a.Type == actorType {
+			return a.Count, true
+		}
+	}
+	return 0, false
+}
+
+// WaitUntilActorTypeHosted blocks until the actor runtime reports actorType
+// among its hosted types. A restarted daprd re-registers its actor types
+// after it becomes healthy, so an invocation right after WaitUntilRunning can
+// find the type unregistered.
+func (d *Daprd) WaitUntilActorTypeHosted(t *testing.T, ctx context.Context, actorType string) {
+	t.Helper()
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		for _, a := range d.GetMetaActorRuntime(c, ctx).ActiveActors {
+			if a.Type == actorType {
+				return
+			}
+		}
+		assert.Fail(c, "actor type not hosted yet", actorType)
+	}, time.Second*20, time.Millisecond*10)
 }
